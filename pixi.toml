@@ -1,0 +1,21 @@
+[workspace]
+name = "zeptocode-cli"
+version = "0.1.0"
+description = "ZeptoCodeCLI: a Go/BubbleTea TUI frontend for Letta Code, speaking the app-server protocol"
+channels = ["conda-forge"]
+platforms = ["linux-64", "win-64"]
+
+[activation.env]
+# Pure-Go project; conda-forge's go otherwise demands the conda C toolchain.
+CGO_ENABLED = "0"
+
+[dependencies]
+go = ">=1.23"
+nushell = "*"
+uutils-coreutils = "*"
+
+[tasks]
+# Protocol de-risking spike: spawns a dedicated app-server, runs one turn, dumps frames.
+spike = "go run ./cmd/spike"
+tidy = "go mod tidy"
+build = "go build ./..."

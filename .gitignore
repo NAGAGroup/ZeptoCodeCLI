@@ -1,0 +1,8 @@
+# pixi environments
+.pixi/
+
+# Go build output
+/bin/
+/zeptocode-cli
+/spike
+/zc
