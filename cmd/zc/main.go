@@ -20,7 +20,6 @@ import (
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
@@ -28,6 +27,7 @@ import (
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/client"
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/protocol"
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/ui/form"
+	"github.com/NAGAGroup/ZeptoCodeCLI/internal/ui/list"
 )
 
 // ── entry model ──
@@ -101,11 +101,11 @@ type model struct {
 	port      int
 	serverLog *os.File
 
-	viewport viewport.Model
-	input    textarea.Model
-	ready    bool
-	width    int
-	height   int
+	list   *list.List
+	input  textarea.Model
+	ready  bool
+	width  int
+	height int
 
 	entries       []*entry
 	openAssistant *entry // streaming aggregation target (run-scoped, not id-scoped)
@@ -188,6 +188,7 @@ func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) 
 		helpModel:     newHelp(),
 		spin:          sp,
 		input:         ta,
+		list:          list.New(),
 		toolByCallID:  map[string]*entry{},
 		loopStatus:    protocol.LoopWaitingOnInput,
 		mode:          "?", // real mode arrives via update_device_status
@@ -195,6 +196,19 @@ func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) 
 		seenApprovals: map[string]bool{},
 	}
 }
+
+// ── list adapter: entries as lazily rendered list items ──
+
+// entryItem adapts an entry to list.Item. Rendering goes through the
+// model's renderEntry (markdown renderer, display toggles); the cache key
+// is the same invalidation key renderEntry uses.
+type entryItem struct {
+	e *entry
+	m *model
+}
+
+func (it entryItem) Render(w int) string { return it.m.renderEntry(it.e, w) }
+func (it entryItem) CacheKey() string    { return it.m.entryCacheKey(it.e) }
 
 // replayHistory renders past conversation messages into transcript entries.
 // Unlike live deltas, each history message is complete, so streaming
@@ -324,8 +338,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.replayHistory(msg.history)
 		}
 		m.layout()
-		m.refreshViewport()
-		m.viewport.GotoBottom()
+		m.list.GotoBottom()
 		return m, waitForFrame(m.cli.Frames)
 
 	case spinner.TickMsg:
@@ -339,9 +352,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseWheelMsg:
 		// Wheel scrolls the transcript; other mouse events are ignored.
-		var cmd tea.Cmd
-		m.viewport, cmd = m.viewport.Update(msg)
-		return m, cmd
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.list.ScrollBy(-3)
+		case tea.MouseWheelDown:
+			m.list.ScrollBy(3)
+		}
+		return m, nil
 
 	case framesMsg:
 		for i := range msg.frames {
@@ -406,7 +423,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshViewport()
 			return m, nil
 		}
-		m.entries = nil
+		m.resetEntries()
 		m.toolByCallID = map[string]*entry{}
 		m.approvals = nil
 		m.seenApprovals = map[string]bool{}
@@ -418,7 +435,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.appendEntry(&entry{kind: entryInfo, text: "switched to " + msg.conversationID})
 		m.refreshViewport()
-		m.viewport.GotoBottom()
+		m.list.GotoBottom()
 		return m, nil
 
 	case disconnectedMsg:
@@ -749,10 +766,24 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-	case "pgup", "pgdown", "ctrl+u", "ctrl+d", "home", "end":
-		var cmd tea.Cmd
-		m.viewport, cmd = m.viewport.Update(msg)
-		return m, cmd
+	case "pgup":
+		m.list.PageUp()
+		return m, nil
+	case "pgdown":
+		m.list.PageDown()
+		return m, nil
+	case "ctrl+u":
+		m.list.HalfUp()
+		return m, nil
+	case "ctrl+d":
+		m.list.HalfDown()
+		return m, nil
+	case "home":
+		m.list.GotoTop()
+		return m, nil
+	case "end":
+		m.list.GotoBottom()
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -1480,6 +1511,13 @@ func (m *model) turnActive() bool {
 
 func (m *model) appendEntry(e *entry) {
 	m.entries = append(m.entries, e)
+	m.list.Append(entryItem{e: e, m: m})
+}
+
+// resetEntries clears the transcript (conversation switch).
+func (m *model) resetEntries() {
+	m.entries = nil
+	m.list.SetItems(nil)
 }
 
 // extraHeight is everything between the viewport and the statusline other
@@ -1537,37 +1575,17 @@ func (m *model) layout() {
 	if vpH < 3 {
 		vpH = 3
 	}
-	if !m.ready {
-		m.viewport = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(vpH))
-		m.ready = true
-	} else {
-		m.viewport.SetWidth(m.width)
-		m.viewport.SetHeight(vpH)
-	}
+	m.list.SetSize(m.width, vpH)
+	m.ready = m.width > 0
 	m.input.SetWidth(m.width - 2)
-	m.refreshViewport()
 }
 
+// refreshViewport keeps the window geometry honest when modal/activity/
+// completion heights change. Content updates need no work here — the lazy
+// list materializes them on the next View().
 func (m *model) refreshViewport() {
-	if !m.ready {
-		return
-	}
-	atBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(m.renderTranscript())
-	if atBottom {
-		m.viewport.GotoBottom()
-	}
-	// Overlay/modal/activity heights change with state; keep geometry honest.
 	if h := m.extraHeight(); h != m.lastModalH {
-		m.lastModalH = h
-		statusH := 1
-		inputH := m.input.Height() + 1
-		vpH := m.height - statusH - inputH - h
-		if vpH < 3 {
-			vpH = 3
-		}
-		m.viewport.SetHeight(vpH)
-		m.viewport.GotoBottom()
+		m.layout()
 	}
 }
 
@@ -1596,14 +1614,19 @@ func (m *model) markdownRenderer(width int) *glamour.TermRenderer {
 	return r
 }
 
-// renderEntry renders one entry with caching: the cache key covers width,
-// content length, and every display toggle that affects output — so a full
-// transcript render is a string join of cached blocks, and only entries
-// whose content or state changed pay rendering cost.
-func (m *model) renderEntry(e *entry, w int) string {
-	key := fmt.Sprintf("%d|%d|%d|%d|%s|%v|%v",
-		w, len(e.text), e.toolArgs.Len(), len(e.toolReturn),
+// entryCacheKey is the invalidation key shared by renderEntry's memo and
+// the list-level line cache: content lengths + every display toggle that
+// affects output.
+func (m *model) entryCacheKey(e *entry) string {
+	return fmt.Sprintf("%d|%d|%d|%s|%v|%v",
+		len(e.text), e.toolArgs.Len(), len(e.toolReturn),
 		e.toolStatus, m.showReasoning, m.showToolOutput)
+}
+
+// renderEntry renders one entry with caching: only entries whose content
+// or display state changed pay rendering cost.
+func (m *model) renderEntry(e *entry, w int) string {
+	key := fmt.Sprintf("%d|%s", w, m.entryCacheKey(e))
 	if e.cachedKey == key && e.cachedRender != "" {
 		return e.cachedRender
 	}
@@ -1671,19 +1694,6 @@ func (m *model) renderEntry(e *entry, w int) string {
 	e.cachedRender = out
 	e.cachedKey = key
 	return out
-}
-
-func (m *model) renderTranscript() string {
-	w := m.width
-	if w <= 0 {
-		w = 80
-	}
-	var b strings.Builder
-	for _, e := range m.entries {
-		b.WriteString(m.renderEntry(e, w))
-		b.WriteString("\n\n")
-	}
-	return b.String()
 }
 
 func (m *model) renderToolLine(e *entry) string {
@@ -1862,7 +1872,7 @@ func (m *model) viewContent() string {
 	if !m.ready {
 		return m.spin.View() + " connecting…"
 	}
-	parts := []string{m.viewport.View()}
+	parts := []string{m.list.View()}
 	if m.question != nil {
 		parts = append(parts, m.renderQuestion())
 	} else if m.mgmt != nil {
