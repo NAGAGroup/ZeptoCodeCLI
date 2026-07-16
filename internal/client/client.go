@@ -140,6 +140,14 @@ func (c *Client) StartRuntime(ctx context.Context, agent string) error {
 	return c.runtimeStart(ctx, agentID)
 }
 
+// ResolveAgent resolves an agent name or id to an agent id.
+func (c *Client) ResolveAgent(ctx context.Context, nameOrID string) (string, error) {
+	if looksLikeAgentID(nameOrID) {
+		return nameOrID, nil
+	}
+	return c.resolveAgentName(ctx, nameOrID)
+}
+
 // ListAgents returns agents known to the server.
 func (c *Client) ListAgents(ctx context.Context) ([]protocol.AgentSummary, error) {
 	cmd := protocol.AgentListCommand{Type: "agent_list", RequestID: c.nextRequestID()}
@@ -431,6 +439,14 @@ func (c *Client) ChangeMode(mode protocol.PermissionMode) error {
 // SetMode sets the permission mode used for subsequent runtime_starts.
 func (c *Client) SetMode(mode protocol.PermissionMode) {
 	c.opts.Mode = mode
+}
+
+// SetConversation sets the conversation used for subsequent runtime starts
+// (empty id ⇒ create a new conversation). Callers that pick a conversation
+// before the first StartRuntime must use this: the client's Options snapshot
+// is taken at Connect time and knows nothing about later UI choices.
+func (c *Client) SetConversation(conversationID string) {
+	c.opts.ConversationID = conversationID
 }
 
 // SwitchConversation restarts the runtime on a different conversation

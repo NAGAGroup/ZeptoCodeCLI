@@ -159,6 +159,7 @@ type model struct {
 	ctrlCArmed     time.Time
 	reconnectTried bool
 	spinning       bool
+	switching      bool // conversation/agent switch in flight (history loading)
 
 	// startup state machine (phase 4): the TUI owns connection + agent pick
 	phase      int // phaseConnecting | phasePicking | phaseChat
@@ -272,6 +273,8 @@ type connectDoneMsg struct {
 
 type runtimeReadyMsg struct {
 	history []protocol.Delta
+	resumed bool // an existing conversation was requested
+	histErr error
 	err     error
 }
 
@@ -319,17 +322,33 @@ func (m *model) startupConvPicker(agentID string) tea.Cmd {
 				title = c.ID
 			}
 			when := c.LastMessageAt
+			marker := ""
 			if when == "" {
-				when = c.UpdatedAt
+				// Never had a message — resuming it shows nothing.
+				when, marker = c.UpdatedAt, "  (empty)"
 			}
-			items = append(items, overlayItem{id: c.ID, title: title, desc: c.ID + "  " + when})
+			items = append(items, overlayItem{id: c.ID, title: title, desc: c.ID + "  " + when + marker})
 		}
 		ov := &overlay{kind: overlayMgmt, title: "choose a conversation", items: items}
 		ov.onSelect = func(m *model, it overlayItem) tea.Cmd {
 			m.startOpts.ConversationID = it.id
-			return m.startRuntimeCmd(agentID)
+			return m.beginSwitch(m.startRuntimeCmd(agentID))
 		}
 		return mgmtMsg{overlay: ov}
+	}
+}
+
+// resolveThenConvPicker resolves --agent (possibly a name) to an id and opens
+// the startup conversation picker for it.
+func (m *model) resolveThenConvPicker(agent string) tea.Cmd {
+	cli := m.cli
+	pick := m.startupConvPicker
+	return func() tea.Msg {
+		id, err := cli.ResolveAgent(context.Background(), agent)
+		if err != nil {
+			return connectDoneMsg{err: err}
+		}
+		return pick(id)()
 	}
 }
 
@@ -338,14 +357,20 @@ func (m *model) startRuntimeCmd(agent string) tea.Cmd {
 	cli := m.cli
 	conversation := m.startOpts.ConversationID
 	return func() tea.Msg {
+		// Propagate the picked conversation to the client — its Options
+		// snapshot predates the startup picker, and a stale empty value
+		// means "create a new conversation" (the bug that made startup
+		// resumes land in a fresh empty conversation with no history).
+		cli.SetConversation(conversation)
 		if err := cli.StartRuntime(context.Background(), agent); err != nil {
 			return runtimeReadyMsg{err: err}
 		}
 		var hist []protocol.Delta
+		var histErr error
 		if conversation != "" {
-			hist, _ = cli.MessagesList(context.Background())
+			hist, histErr = cli.MessagesList(context.Background())
 		}
-		return runtimeReadyMsg{history: hist}
+		return runtimeReadyMsg{history: hist, resumed: conversation != "", histErr: histErr}
 	}
 }
 
@@ -378,6 +403,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.overlay = &overlay{kind: overlayAgents, title: "choose an agent", items: msg.agents}
 			return m, nil
 		}
+		if m.startOpts.ConversationID == "" {
+			// --agent without --conversation: offer the conversation picker
+			// instead of eagerly creating a fresh conversation. Every launch
+			// used to abandon an empty conversation, and picking those later
+			// looked like "history not populating".
+			m.phase = phasePicking
+			return m, m.resolveThenConvPicker(m.startOpts.Agent)
+		}
 		return m, m.startRuntimeCmd(m.startOpts.Agent)
 
 	case runtimeReadyMsg:
@@ -387,8 +420,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.phase = phaseChat
 		m.overlay = nil
+		m.switching = false
 		if len(msg.history) > 0 {
 			m.replayHistory(msg.history)
+		} else if msg.resumed {
+			// Distinguish "nothing to show" from "fetch silently failed" —
+			// a blank transcript on resume reads as a replay bug.
+			if msg.histErr != nil {
+				m.appendEntry(&entry{kind: entryError, text: "history fetch failed: " + msg.histErr.Error()})
+			} else {
+				m.appendEntry(&entry{kind: entryInfo, text: "(empty conversation — no messages yet)"})
+			}
 		}
 		m.layout()
 		m.list.GotoBottom()
@@ -407,7 +449,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
-		if m.turnActive() || m.question != nil || m.phase != phaseChat {
+		if m.turnActive() || m.question != nil || m.phase != phaseChat || m.switching {
 			return m, cmd
 		}
 		m.spinning = false
@@ -481,6 +523,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case switchedMsg:
+		m.switching = false
 		if msg.err != nil {
 			m.appendEntry(&entry{kind: entryError, text: "switch failed: " + msg.err.Error()})
 			m.refreshViewport()
@@ -495,6 +538,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.closeStreaming()
 		if len(msg.history) > 0 {
 			m.replayHistory(msg.history)
+		} else if msg.resumed {
+			// Distinguish "nothing to show" from "fetch silently failed".
+			if msg.histErr != nil {
+				m.appendEntry(&entry{kind: entryError, text: "history fetch failed: " + msg.histErr.Error()})
+			} else {
+				m.appendEntry(&entry{kind: entryInfo, text: "(empty conversation — no messages yet)"})
+			}
 		}
 		m.appendEntry(&entry{kind: entryInfo, text: "switched to " + msg.conversationID})
 		m.refreshViewport()
@@ -1042,7 +1092,7 @@ var clientCommands = []clientCommand{
 		return nil
 	}},
 	{"new", "start a fresh conversation", func(m *model, _ string) tea.Cmd {
-		return m.switchConversation("")
+		return m.beginSwitch(m.switchConversation(""))
 	}},
 	{"mode", "set permission mode: /mode standard|acceptEdits|unrestricted", func(m *model, args string) tea.Cmd {
 		switch protocol.PermissionMode(strings.TrimSpace(args)) {
@@ -1069,7 +1119,7 @@ var clientCommands = []clientCommand{
 	}},
 	{"fork", "fork this conversation and switch to the fork", func(m *model, _ string) tea.Cmd {
 		cli := m.cli
-		return func() tea.Msg {
+		return m.beginSwitch(func() tea.Msg {
 			forkID, err := cli.Fork(context.Background())
 			if err != nil {
 				return switchedMsg{err: err}
@@ -1077,9 +1127,9 @@ var clientCommands = []clientCommand{
 			if err := cli.SwitchConversation(context.Background(), forkID); err != nil {
 				return switchedMsg{err: err}
 			}
-			hist, _ := cli.MessagesList(context.Background())
-			return switchedMsg{conversationID: forkID, history: hist}
-		}
+			hist, histErr := cli.MessagesList(context.Background())
+			return switchedMsg{conversationID: forkID, history: hist, resumed: true, histErr: histErr}
+		})
 	}},
 	{"title", "set conversation title: /title <text>", func(m *model, args string) tea.Cmd {
 		if strings.TrimSpace(args) == "" {
@@ -1242,10 +1292,12 @@ func (m *model) openConversationPicker() tea.Cmd {
 				title = c.ID
 			}
 			when := c.LastMessageAt
+			marker := ""
 			if when == "" {
-				when = c.UpdatedAt
+				// Never had a message — resuming it shows nothing.
+				when, marker = c.UpdatedAt, "  (empty)"
 			}
-			items = append(items, overlayItem{id: c.ID, title: title, desc: c.ID + "  " + when})
+			items = append(items, overlayItem{id: c.ID, title: title, desc: c.ID + "  " + when + marker})
 		}
 		return conversationsMsg{items: items}
 	}
@@ -1316,7 +1368,7 @@ func (m *model) handleOverlayKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.layout()
 		switch kind {
 		case overlayConversations:
-			return m, m.switchConversation(it.id)
+			return m, m.beginSwitch(m.switchConversation(it.id))
 		case overlayCommands:
 			m.input.SetValue("/" + it.id + " ")
 			m.input.CursorEnd()
@@ -1327,7 +1379,7 @@ func (m *model) handleOverlayKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				// startup: picked an agent — offer its conversations next
 				return m, m.startupConvPicker(it.id)
 			}
-			return m, m.switchAgent(it.id)
+			return m, m.beginSwitch(m.switchAgent(it.id))
 		case overlayModels:
 			return m, m.switchModel(protocol.UpdateModelPayload{ModelID: it.id})
 		case overlayMgmt:
@@ -1349,6 +1401,8 @@ func (m *model) handleOverlayKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 type switchedMsg struct {
 	conversationID string
 	history        []protocol.Delta
+	resumed        bool // an existing conversation was requested
+	histErr        error
 	err            error
 }
 
@@ -1367,11 +1421,24 @@ func (m *model) switchConversation(conversationID string) tea.Cmd {
 			return switchedMsg{err: err}
 		}
 		var hist []protocol.Delta
+		var histErr error
 		if conversationID != "" {
-			hist, _ = cli.MessagesList(context.Background())
+			hist, histErr = cli.MessagesList(context.Background())
 		}
-		return switchedMsg{conversationID: cli.Runtime.ConversationID, history: hist}
+		return switchedMsg{conversationID: cli.Runtime.ConversationID, history: hist, resumed: conversationID != "", histErr: histErr}
 	}
+}
+
+// beginSwitch flags a conversation/agent switch as in flight (statusline
+// shows a "loading conversation…" spinner until switchedMsg/runtimeReadyMsg
+// lands) and kicks the spinner if it is idle.
+func (m *model) beginSwitch(cmd tea.Cmd) tea.Cmd {
+	m.switching = true
+	if !m.spinning {
+		m.spinning = true
+		return tea.Batch(cmd, m.spin.Tick)
+	}
+	return cmd
 }
 
 func (m *model) cycleMode() {
@@ -1911,6 +1978,9 @@ func (m *model) statusline() string {
 		status = m.spin.View() + " " + styleAccent.Render(status)
 	} else {
 		status = styleInfo.Render(status)
+	}
+	if m.switching {
+		status = m.spin.View() + " " + styleAccent.Render("loading conversation…")
 	}
 	if !m.connected {
 		status = styleError.Render("✕ disconnected")
