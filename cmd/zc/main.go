@@ -588,7 +588,15 @@ type switchedMsg struct {
 
 func (m *model) switchConversation(conversationID string) tea.Cmd {
 	cli := m.cli
+	// Carry the CURRENT permission mode into the target conversation —
+	// otherwise new conversations silently reset to the server default
+	// (unrestricted), which reads as "permissions broken".
+	mode := m.mode
 	return func() tea.Msg {
+		switch mode {
+		case protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted:
+			cli.SetMode(mode)
+		}
 		if err := cli.SwitchConversation(context.Background(), conversationID); err != nil {
 			return switchedMsg{err: err}
 		}
@@ -612,8 +620,12 @@ func (m *model) cycleMode() {
 	if err := m.cli.ChangeMode(next); err != nil {
 		m.appendEntry(&entry{kind: entryError, text: "mode change failed: " + err.Error()})
 		m.refreshViewport()
+		return
 	}
-	// statusline updates when update_device_status confirms
+	// Optimistic update: rapid repeated shift+tab must compute each step
+	// from the requested mode, not the last server-confirmed one (the
+	// device_status confirmation races the next keypress).
+	m.mode = next
 }
 
 // tryComplete implements tab completion: "/" prefixes complete against the

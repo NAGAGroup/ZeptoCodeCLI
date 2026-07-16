@@ -340,11 +340,16 @@ func (c *Client) MessagesList(ctx context.Context) ([]protocol.Delta, error) {
 	return resp.Messages, nil
 }
 
-// ConversationsList fetches conversations visible to the server.
+// ConversationsList fetches conversations for the current agent (the local
+// backend filters by agent_id and defaults to limit 20 — raise it).
 func (c *Client) ConversationsList(ctx context.Context) ([]protocol.ConversationSummary, error) {
 	cmd := protocol.ConversationListCommand{
 		Type:      "conversation_list",
 		RequestID: c.nextRequestID(),
+		Query: map[string]any{
+			"agent_id": c.Runtime.AgentID,
+			"limit":    200,
+		},
 	}
 	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -383,6 +388,11 @@ func (c *Client) ChangeMode(mode protocol.PermissionMode) error {
 		Runtime: c.Runtime,
 		Payload: protocol.ChangeDeviceStatePayload{Mode: mode},
 	})
+}
+
+// SetMode sets the permission mode used for subsequent runtime_starts.
+func (c *Client) SetMode(mode protocol.PermissionMode) {
+	c.opts.Mode = mode
 }
 
 // SwitchConversation restarts the runtime on a different conversation
