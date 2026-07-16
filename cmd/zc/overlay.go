@@ -12,8 +12,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 type overlayKind int
@@ -44,16 +42,28 @@ func (o *overlay) filtered() []overlayItem {
 	if o.filter == "" {
 		return o.items
 	}
-	f := strings.ToLower(o.filter)
-	var out []overlayItem
+	type scored struct {
+		it    overlayItem
+		score int
+	}
+	var out []scored
 	for _, it := range o.items {
-		if strings.Contains(strings.ToLower(it.id), f) ||
-			strings.Contains(strings.ToLower(it.title), f) ||
-			strings.Contains(strings.ToLower(it.desc), f) {
-			out = append(out, it)
+		best := -1
+		for _, hay := range []string{it.id, it.title, it.desc} {
+			if s := fuzzyScore(o.filter, hay); s >= 0 && (best < 0 || s < best) {
+				best = s
+			}
+		}
+		if best >= 0 {
+			out = append(out, scored{it, best})
 		}
 	}
-	return out
+	sort.SliceStable(out, func(a, b int) bool { return out[a].score < out[b].score })
+	items := make([]overlayItem, len(out))
+	for i, s := range out {
+		items[i] = s.it
+	}
+	return items
 }
 
 func (o *overlay) clampSel() {
@@ -65,13 +75,6 @@ func (o *overlay) clampSel() {
 		o.sel = 0
 	}
 }
-
-var (
-	styleOverlay      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("6")).Padding(0, 1)
-	styleOverlaySel   = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("6"))
-	styleOverlayTitle = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
-	styleOverlayDim   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-)
 
 func (o *overlay) render(width, maxRows int) string {
 	items := o.filtered()

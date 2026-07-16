@@ -8,21 +8,21 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/client"
@@ -54,42 +54,41 @@ type entry struct {
 	toolReturn string // trimmed tool output, shown when ctrl+o enabled
 	// command entries
 	cmdInput string
-	// render cache (assistant markdown is expensive)
+	// render cache: every kind caches its final rendered block, keyed on
+	// width + content + display state (see model.renderEntry)
 	cachedRender string
-	cachedWidth  int
-	cachedLen    int
+	cachedKey    string
 }
 
 // ── tea messages ──
 
-type frameMsg struct{ frame protocol.Frame }
+type framesMsg struct{ frames []protocol.Frame }
 type disconnectedMsg struct{}
 
+// waitForFrame blocks for one frame, then drains everything already queued:
+// heavy streams (subagent bursts) collapse into one render per batch instead
+// of one render per frame — this is what un-freezes the UI under load.
 func waitForFrame(frames <-chan protocol.Frame) tea.Cmd {
 	return func() tea.Msg {
 		f, ok := <-frames
 		if !ok {
 			return disconnectedMsg{}
 		}
-		return frameMsg{frame: f}
+		batch := []protocol.Frame{f}
+		for len(batch) < 512 {
+			select {
+			case f, ok := <-frames:
+				if !ok {
+					return framesMsg{frames: batch}
+				}
+				batch = append(batch, f)
+			default:
+				return framesMsg{frames: batch}
+			}
+		}
+		return framesMsg{frames: batch}
 	}
 }
-
-// ── styles ──
-
-var (
-	styleUser       = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
-	styleAgent      = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	styleReasoning  = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
-	styleTool       = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	styleToolOK     = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	styleToolErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	styleInfo       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleError      = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	styleStatus     = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("6")).Padding(0, 1)
-	styleStatusBusy = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("3")).Padding(0, 1)
-	styleModal      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("11")).Padding(0, 1)
-)
 
 // ── model ──
 
@@ -128,6 +127,11 @@ type model struct {
 
 	// milestone 3+ state
 	overlay        *overlay
+	completion     completionState
+	question       *questionForm // AskUserQuestion takes over the modal slot
+	helpModel      help.Model
+	showHelp       bool
+	spin           spinner.Model
 	showReasoning  bool // reasoning collapsed by default
 	showToolOutput bool // tool-return previews hidden by default
 	queue          []protocol.QueueItem
@@ -139,7 +143,19 @@ type model struct {
 	serverCWD      string
 	ctrlCArmed     time.Time
 	reconnectTried bool
+	spinning       bool
+
+	// startup state machine (phase 4): the TUI owns connection + agent pick
+	phase      int // phaseConnecting | phasePicking | phaseChat
+	startupErr string
+	startOpts  client.Options
 }
+
+const (
+	phaseConnecting = iota
+	phasePicking
+	phaseChat
+)
 
 // testedLettaCode is the letta-code minor-version prefix this client was
 // verified against. There is no wire version negotiation; drift gets a
@@ -148,16 +164,21 @@ const testedLettaCode = "0.28."
 
 func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) *model {
 	ta := textarea.New()
-	ta.Placeholder = "Message the agent · enter sends · / commands · ctrl+k palette · ctrl+p conversations"
-	ta.Prompt = "┃ "
+	ta.Placeholder = "Message the agent · / for commands · @ for files · ctrl+g for help"
+	ta.Prompt = ""
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
 	ta.Focus()
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(theme.Accent)
 	return &model{
 		cli:           cli,
 		logPath:       logPath,
 		port:          port,
 		serverLog:     serverLog,
+		helpModel:     newHelp(),
+		spin:          sp,
 		input:         ta,
 		toolByCallID:  map[string]*entry{},
 		loopStatus:    protocol.LoopWaitingOnInput,
@@ -204,7 +225,59 @@ func (m *model) replayHistory(msgs []protocol.Delta) {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(waitForFrame(m.cli.Frames), textarea.Blink)
+	return tea.Batch(m.connectCmd(), m.spin.Tick, textarea.Blink)
+}
+
+type connectDoneMsg struct {
+	cli    *client.Client
+	agents []overlayItem // non-nil ⇒ user must pick
+	err    error
+}
+
+type runtimeReadyMsg struct {
+	history []protocol.Delta
+	err     error
+}
+
+// connectCmd spawns the app-server and either starts the runtime directly
+// (--agent given) or fetches the agent list for the in-TUI picker.
+func (m *model) connectCmd() tea.Cmd {
+	opts := m.startOpts
+	return func() tea.Msg {
+		cli, err := client.Connect(context.Background(), opts)
+		if err != nil {
+			return connectDoneMsg{err: err}
+		}
+		if opts.Agent == "" {
+			agents, err := cli.ListAgents(context.Background())
+			if err != nil {
+				cli.Close()
+				return connectDoneMsg{err: err}
+			}
+			items := make([]overlayItem, 0, len(agents))
+			for _, a := range agents {
+				items = append(items, overlayItem{id: a.ID, title: a.Name, desc: a.ID})
+			}
+			return connectDoneMsg{cli: cli, agents: items}
+		}
+		return connectDoneMsg{cli: cli}
+	}
+}
+
+// startRuntimeCmd starts the runtime for agent and fetches history if resuming.
+func (m *model) startRuntimeCmd(agent string) tea.Cmd {
+	cli := m.cli
+	conversation := m.startOpts.ConversationID
+	return func() tea.Msg {
+		if err := cli.StartRuntime(context.Background(), agent); err != nil {
+			return runtimeReadyMsg{err: err}
+		}
+		var hist []protocol.Delta
+		if conversation != "" {
+			hist, _ = cli.MessagesList(context.Background())
+		}
+		return runtimeReadyMsg{history: hist}
+	}
 }
 
 // ── update ──
@@ -219,16 +292,64 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case connectDoneMsg:
+		if msg.err != nil {
+			m.startupErr = msg.err.Error()
+			return m, nil
+		}
+		m.cli = msg.cli
+		if msg.agents != nil {
+			m.phase = phasePicking
+			m.overlay = &overlay{kind: overlayAgents, title: "choose an agent", items: msg.agents}
+			return m, nil
+		}
+		return m, m.startRuntimeCmd(m.startOpts.Agent)
+
+	case runtimeReadyMsg:
+		if msg.err != nil {
+			m.startupErr = msg.err.Error()
+			return m, nil
+		}
+		m.phase = phaseChat
+		m.overlay = nil
+		if len(msg.history) > 0 {
+			m.replayHistory(msg.history)
+		}
+		m.layout()
+		m.refreshViewport()
+		m.viewport.GotoBottom()
+		return m, waitForFrame(m.cli.Frames)
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(msg)
+		if m.turnActive() || m.question != nil || m.phase != phaseChat {
+			return m, cmd
+		}
+		m.spinning = false
+		return m, nil // stop ticking when idle
+
 	case tea.MouseMsg:
 		// Wheel scrolls the transcript; everything else is ignored.
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		return m, cmd
 
-	case frameMsg:
-		m.handleFrame(msg.frame)
+	case framesMsg:
+		for i := range msg.frames {
+			m.handleFrame(msg.frames[i])
+		}
 		m.refreshViewport()
-		return m, waitForFrame(m.cli.Frames)
+		cmds := []tea.Cmd{waitForFrame(m.cli.Frames)}
+		if m.question != nil && !m.question.inited {
+			m.question.inited = true
+			cmds = append(cmds, m.question.form.Init())
+		}
+		if m.turnActive() && !m.spinning {
+			m.spinning = true
+			cmds = append(cmds, m.spin.Tick)
+		}
+		return m, tea.Batch(cmds...)
 
 	case conversationsMsg:
 		if msg.err != nil {
@@ -287,10 +408,43 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForFrame(m.cli.Frames)
 	}
 
+	// huh's internal messages (from Init/its own cmds) must reach the form.
+	if m.question != nil {
+		form, cmd := m.question.form.Update(msg)
+		if f, ok := form.(*huh.Form); ok {
+			m.question.form = f
+		}
+		m.finishQuestionIfDone()
+		return m, cmd
+	}
+
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	m.autosizeInput()
+	m.refreshCompletions()
 	return m, cmd
+}
+
+// finishQuestionIfDone submits the answers once the huh form reports
+// completion — which can happen on huh's own async messages, not only on
+// the keypress that triggered it.
+func (m *model) finishQuestionIfDone() {
+	if m.question == nil || m.question.form.State != huh.StateCompleted {
+		return
+	}
+	qf := m.question
+	m.question = nil
+	m.layout()
+	if err := m.cli.RespondApproval(qf.req.RequestID, qf.decision()); err != nil {
+		m.appendEntry(&entry{kind: entryError, text: "answer send failed: " + err.Error()})
+	} else {
+		var parts []string
+		for q, a := range qf.answers() {
+			parts = append(parts, compactOneLine(q, 40)+" → "+a)
+		}
+		m.appendEntry(&entry{kind: entryInfo, text: "answered: " + strings.Join(parts, " · ")})
+	}
+	m.refreshViewport()
 }
 
 type reconnectedMsg struct {
@@ -339,7 +493,46 @@ func (m *model) autosizeInput() {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Overlays swallow keys first (user-invoked, so they take precedence).
+	// Startup phases: only the agent picker (and quitting) are interactive.
+	if m.phase != phaseChat {
+		if msg.String() == "ctrl+c" || (msg.String() == "esc" && m.overlay == nil) {
+			m.quitting = true
+			return m, tea.Quit
+		}
+		if m.overlay != nil {
+			return m.handleOverlayKey(msg)
+		}
+		return m, nil
+	}
+
+	// Question form takes the whole modal slot while active.
+	if m.question != nil {
+		if msg.String() == "ctrl+c" {
+			m.quitting = true
+			return m, tea.Quit
+		}
+		if msg.String() == "esc" {
+			req := m.question.req
+			m.question = nil
+			m.layout()
+			if err := m.cli.RespondApproval(req.RequestID, protocol.ApprovalDecision{
+				Behavior: "deny",
+				Message:  "User dismissed the question form.",
+			}); err != nil {
+				m.appendEntry(&entry{kind: entryError, text: "deny send failed: " + err.Error()})
+			}
+			m.refreshViewport()
+			return m, nil
+		}
+		form, cmd := m.question.form.Update(msg)
+		if f, ok := form.(*huh.Form); ok {
+			m.question.form = f
+		}
+		m.finishQuestionIfDone()
+		return m, cmd
+	}
+
+	// Overlays swallow keys next (user-invoked, so they take precedence).
 	if m.overlay != nil {
 		return m.handleOverlayKey(msg)
 	}
@@ -418,16 +611,31 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		m.cycleMode()
 		return m, nil
-	case "tab":
-		if m.tryComplete() {
+	case "ctrl+g":
+		m.showHelp = !m.showHelp
+		m.layout()
+		return m, nil
+	case "tab", "right":
+		if m.completion.visible {
+			m.acceptCompletion()
 			return m, nil
 		}
+		if msg.String() == "tab" {
+			return m, nil // swallow raw tabs; textarea tabs are never wanted
+		}
 	case "enter":
+		// An incomplete /command with the dropdown open: enter completes.
+		if m.completion.visible && strings.HasPrefix(m.input.Value(), "/") &&
+			!strings.Contains(m.input.Value(), " ") {
+			m.acceptCompletion()
+			return m, nil
+		}
 		text := strings.TrimSpace(m.input.Value())
 		if text == "" {
 			return m, nil
 		}
 		m.input.Reset()
+		m.completion = completionState{}
 		m.history = append(m.history, text)
 		m.historyIdx = len(m.history)
 		if strings.HasPrefix(text, "/") {
@@ -445,6 +653,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.InsertString("\n")
 		return m, nil
 	case "up":
+		if m.completion.visible {
+			if m.completion.sel > 0 {
+				m.completion.sel--
+			}
+			return m, nil
+		}
 		// History recall when the input is empty or already navigating.
 		if len(m.history) > 0 && (m.input.Value() == "" || m.historyIdx < len(m.history)) {
 			if m.historyIdx > 0 {
@@ -455,6 +669,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case "down":
+		if m.completion.visible {
+			if m.completion.sel < len(m.completion.items)-1 {
+				m.completion.sel++
+			}
+			return m, nil
+		}
 		if m.historyIdx < len(m.history) {
 			m.historyIdx++
 			if m.historyIdx == len(m.history) {
@@ -568,7 +788,11 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.SetValue("/" + it.id + " ")
 			m.input.CursorEnd()
 			m.input.Focus()
-		case overlayJobs, overlayAgents:
+			m.refreshCompletions()
+		case overlayAgents:
+			// startup picker: launch the chosen runtime
+			return m, m.startRuntimeCmd(it.id)
+		case overlayJobs:
 			// informational; nothing to launch
 		}
 		return m, nil
@@ -626,74 +850,6 @@ func (m *model) cycleMode() {
 	// from the requested mode, not the last server-confirmed one (the
 	// device_status confirmation races the next keypress).
 	m.mode = next
-}
-
-// tryComplete implements tab completion: "/" prefixes complete against the
-// command palette, "@" tokens complete against the filesystem (server cwd).
-func (m *model) tryComplete() bool {
-	val := m.input.Value()
-	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
-		prefix := strings.ToLower(strings.TrimPrefix(val, "/"))
-		var matches []string
-		for _, c := range m.knownCommands() {
-			if strings.HasPrefix(strings.ToLower(c.id), prefix) {
-				matches = append(matches, c.id)
-			}
-		}
-		if len(matches) == 1 {
-			m.input.SetValue("/" + matches[0] + " ")
-			m.input.CursorEnd()
-			return true
-		}
-		if len(matches) > 1 {
-			m.appendEntry(&entry{kind: entryInfo, text: "matches: /" + strings.Join(matches, "  /")})
-			m.refreshViewport()
-			return true
-		}
-		return false
-	}
-	// @-file completion on the last whitespace-separated token.
-	fields := strings.Split(val, " ")
-	last := fields[len(fields)-1]
-	if !strings.HasPrefix(last, "@") {
-		return false
-	}
-	frag := strings.TrimPrefix(last, "@")
-	base := m.serverCWD
-	if base == "" {
-		base, _ = os.Getwd()
-	}
-	dir, partial := filepath.Split(frag)
-	list, err := os.ReadDir(filepath.Join(base, dir))
-	if err != nil {
-		return false
-	}
-	var matches []string
-	for _, de := range list {
-		if strings.HasPrefix(de.Name(), partial) {
-			name := de.Name()
-			if de.IsDir() {
-				name += "/"
-			}
-			matches = append(matches, name)
-		}
-	}
-	if len(matches) == 1 {
-		fields[len(fields)-1] = "@" + dir + matches[0]
-		m.input.SetValue(strings.Join(fields, " "))
-		m.input.CursorEnd()
-		return true
-	}
-	if len(matches) > 1 {
-		show := matches
-		if len(show) > 12 {
-			show = show[:12]
-		}
-		m.appendEntry(&entry{kind: entryInfo, text: "files: " + strings.Join(show, "  ")})
-		m.refreshViewport()
-		return true
-	}
-	return false
 }
 
 func (m *model) dispatchSlashCommand(text string) {
@@ -785,6 +941,12 @@ func (m *model) handleFrame(f protocol.Frame) {
 		m.subagents = f.SubagentUpdate.Subagents
 
 	case f.StreamDelta != nil:
+		// Subagent token streams never enter the transcript (matches the
+		// native client): their status arrives via update_subagent_state
+		// and renders as activity rollups.
+		if f.StreamDelta.SubagentID != "" {
+			return
+		}
 		m.handleDelta(&f.StreamDelta.Delta)
 	}
 }
@@ -797,6 +959,14 @@ func (m *model) enqueueApproval(req *protocol.ControlRequest) {
 		return
 	}
 	m.seenApprovals[req.RequestID] = true
+	// AskUserQuestion gets a real form, not an allow/deny modal.
+	if isQuestionRequest(req) {
+		if qf := newQuestionForm(req); qf != nil {
+			m.question = qf
+			m.layout()
+			return
+		}
+	}
 	m.approvals = append(m.approvals, req)
 	id := req.Request.ToolCallID
 	if _, ok := m.toolByCallID[id]; !ok && id != "" {
@@ -938,11 +1108,14 @@ func (m *model) appendEntry(e *entry) {
 	m.entries = append(m.entries, e)
 }
 
-// extraHeight is everything between the viewport and the input: overlay or
-// approval modal, plus queue/subagent activity lines.
+// extraHeight is everything between the viewport and the statusline other
+// than the input itself: modal slot, activity lines, completion dropdown,
+// help view, and the input border (2 rows).
 func (m *model) extraHeight() int {
-	h := 0
-	if m.overlay != nil {
+	h := 2 // input border
+	if m.question != nil {
+		h += lipgloss.Height(m.renderQuestion())
+	} else if m.overlay != nil {
 		h += lipgloss.Height(m.overlay.render(m.width, 14))
 	} else if len(m.approvals) > 0 {
 		h += lipgloss.Height(m.renderModal())
@@ -950,7 +1123,23 @@ func (m *model) extraHeight() int {
 	if act := m.activityLines(); act != "" {
 		h += lipgloss.Height(act)
 	}
+	if m.completion.visible {
+		h += lipgloss.Height(m.renderCompletions())
+	}
+	if m.showHelp {
+		h += lipgloss.Height(m.helpModel.FullHelpView(keys.FullHelp()))
+	}
 	return h
+}
+
+func (m *model) renderQuestion() string {
+	w := m.width - 4
+	if w < 20 {
+		w = 20
+	}
+	title := styleAccent.Render("agent asks") + styleInfo.Render("  (esc dismisses = deny)")
+	return styleModal.BorderForeground(theme.Accent).Width(w).
+		Render(title + "\n\n" + m.question.form.View())
 }
 
 func (m *model) layout() {
@@ -1015,25 +1204,55 @@ func (m *model) markdownRenderer(width int) *glamour.TermRenderer {
 	return r
 }
 
-// renderAssistant renders markdown with a per-entry cache: only the entry
-// whose text grew (the streaming one) pays the glamour cost per frame.
-func (m *model) renderAssistant(e *entry, width int) string {
-	if e.cachedWidth == width && e.cachedLen == len(e.text) && e.cachedRender != "" {
+// renderEntry renders one entry with caching: the cache key covers width,
+// content length, and every display toggle that affects output — so a full
+// transcript render is a string join of cached blocks, and only entries
+// whose content or state changed pay rendering cost.
+func (m *model) renderEntry(e *entry, w int) string {
+	key := fmt.Sprintf("%d|%d|%d|%d|%s|%v|%v",
+		w, len(e.text), e.toolArgs.Len(), len(e.toolReturn),
+		e.toolStatus, m.showReasoning, m.showToolOutput)
+	if e.cachedKey == key && e.cachedRender != "" {
 		return e.cachedRender
 	}
-	out := ""
-	if r := m.markdownRenderer(width); r != nil {
-		if rendered, err := r.Render(e.text); err == nil {
-			out = strings.Trim(rendered, "\n")
+	wrap := lipgloss.NewStyle().Width(w)
+	var out string
+	switch e.kind {
+	case entryUser:
+		out = wrap.Render(rail(theme.User) + styleUser.Render("you ▸ ") + e.text)
+	case entryAssistant:
+		md := ""
+		if r := m.markdownRenderer(w - 2); r != nil {
+			if rendered, err := r.Render(e.text); err == nil {
+				md = strings.Trim(rendered, "\n")
+			}
 		}
+		if md == "" {
+			md = e.text
+		}
+		out = rail(theme.Agent) + styleAgent.Render("agent ▸") + "\n" + md
+	case entryReasoning:
+		if m.showReasoning {
+			out = wrap.Render(styleReasoning.Render("· " + e.text))
+		} else {
+			out = wrap.Render(styleReasoning.Render(fmt.Sprintf(
+				"· reasoning (%d chars — ctrl+r expands)", len(e.text))))
+		}
+	case entryTool:
+		line := m.renderToolLine(e)
+		if m.showToolOutput && e.toolReturn != "" {
+			line += "\n" + styleInfo.Render(indentLines(e.toolReturn, "  │ "))
+		}
+		out = wrap.Render(line)
+	case entryCommand:
+		out = wrap.Render(styleAccent.Render("⌁ "+e.cmdInput) + "\n" + e.text)
+	case entryInfo:
+		out = wrap.Render(styleInfo.Render(e.text))
+	case entryError:
+		out = wrap.Render(styleError.Render(e.text))
 	}
-	if out == "" {
-		out = e.text
-	}
-	out = styleAgent.Render("agent ▸") + "\n" + out
 	e.cachedRender = out
-	e.cachedWidth = width
-	e.cachedLen = len(e.text)
+	e.cachedKey = key
 	return out
 }
 
@@ -1042,34 +1261,9 @@ func (m *model) renderTranscript() string {
 	if w <= 0 {
 		w = 80
 	}
-	wrap := lipgloss.NewStyle().Width(w)
 	var b strings.Builder
 	for _, e := range m.entries {
-		switch e.kind {
-		case entryUser:
-			b.WriteString(wrap.Render(styleUser.Render("you ▸ ") + e.text))
-		case entryAssistant:
-			b.WriteString(m.renderAssistant(e, w-2))
-		case entryReasoning:
-			if m.showReasoning {
-				b.WriteString(wrap.Render(styleReasoning.Render("· " + e.text)))
-			} else {
-				b.WriteString(wrap.Render(styleReasoning.Render(fmt.Sprintf(
-					"· reasoning (%d chars — ctrl+r expands)", len(e.text)))))
-			}
-		case entryTool:
-			line := m.renderToolLine(e)
-			if m.showToolOutput && e.toolReturn != "" {
-				line += "\n" + styleInfo.Render(indentLines(e.toolReturn, "  │ "))
-			}
-			b.WriteString(wrap.Render(line))
-		case entryCommand:
-			b.WriteString(wrap.Render(styleInfo.Render("⌁ "+e.cmdInput) + "\n" + e.text))
-		case entryInfo:
-			b.WriteString(wrap.Render(styleInfo.Render(e.text)))
-		case entryError:
-			b.WriteString(wrap.Render(styleError.Render(e.text)))
-		}
+		b.WriteString(m.renderEntry(e, w))
 		b.WriteString("\n\n")
 	}
 	return b.String()
@@ -1089,12 +1283,6 @@ func (m *model) renderToolLine(e *entry) string {
 		return styleTool.Render(label + " …")
 	}
 }
-
-var (
-	styleDiffAdd    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	styleDiffRemove = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	styleDiffCtx    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-)
 
 func renderDiffs(diffs []protocol.DiffPreview, maxLines int) string {
 	var b strings.Builder
@@ -1159,23 +1347,46 @@ func (m *model) renderModal() string {
 	return styleModal.Width(w).Render(body)
 }
 
+// verbStatus humanizes loop states.
+func verbStatus(s string) string {
+	switch s {
+	case protocol.LoopSendingAPIRequest, protocol.LoopWaitingForResponse:
+		return "thinking"
+	case protocol.LoopRetryingAPIRequest:
+		return "retrying"
+	case protocol.LoopProcessingResponse:
+		return "responding"
+	case protocol.LoopExecutingClientTool, "EXECUTING_COMMAND":
+		return "running tool"
+	case protocol.LoopWaitingOnApproval:
+		return "waiting on you"
+	case protocol.LoopWaitingOnInput:
+		return "ready"
+	default:
+		return strings.ToLower(strings.ReplaceAll(s, "_", " "))
+	}
+}
+
 func (m *model) statusline() string {
-	style := styleStatus
-	status := m.loopStatus
+	status := verbStatus(m.loopStatus)
 	if m.turnActive() {
-		style = styleStatusBusy
+		status = m.spin.View() + " " + status
 	}
 	if !m.connected {
-		status = "DISCONNECTED"
-		style = styleStatusBusy
+		status = styleError.Render("disconnected")
 	}
-	left := fmt.Sprintf("%s · %s · %s",
-		shortID(m.cli.Runtime.AgentID), m.cli.Runtime.ConversationID, m.mode)
+	mode := styleStatusMode.Foreground(modeColor(m.mode)).Render(string(m.mode))
+	left := fmt.Sprintf(" %s · %s · %s · %s",
+		shortID(m.cli.Runtime.AgentID), m.cli.Runtime.ConversationID, mode, status)
 	if n := len(m.queue); n > 0 {
-		left += fmt.Sprintf(" · q:%d", n)
+		left += styleAccent.Render(fmt.Sprintf(" · ⧗%d", n))
 	}
-	line := fmt.Sprintf("%s │ %s │ ^k cmds ^p convs ^j jobs", left, status)
-	return style.Width(m.width).Render(line)
+	right := styleInfo.Render("^k cmds · ^p convs · ^j jobs · ^g help ")
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		return left
+	}
+	return left + strings.Repeat(" ", gap) + right
 }
 
 // activityLines renders queue + subagent status between transcript and input.
@@ -1206,11 +1417,29 @@ func (m *model) View() string {
 	if m.quitting {
 		return ""
 	}
+	if m.phase != phaseChat {
+		var body string
+		switch {
+		case m.startupErr != "":
+			body = styleError.Render("startup failed: "+m.startupErr) +
+				styleInfo.Render("\n(server log: "+m.logPath+")\n\npress ctrl+c to exit")
+		case m.overlay != nil:
+			body = m.overlay.render(max(m.width, 40), 16)
+		default:
+			body = m.spin.View() + " " + styleInfo.Render("starting app-server…")
+		}
+		if m.width > 0 && m.height > 0 {
+			return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
+		}
+		return body
+	}
 	if !m.ready {
-		return "connecting…"
+		return m.spin.View() + " connecting…"
 	}
 	parts := []string{m.viewport.View()}
-	if m.overlay != nil {
+	if m.question != nil {
+		parts = append(parts, m.renderQuestion())
+	} else if m.overlay != nil {
 		parts = append(parts, m.overlay.render(m.width, 14))
 	} else if len(m.approvals) > 0 {
 		parts = append(parts, m.renderModal())
@@ -1218,7 +1447,21 @@ func (m *model) View() string {
 	if act := m.activityLines(); act != "" {
 		parts = append(parts, act)
 	}
-	parts = append(parts, m.input.View(), m.statusline())
+	// The input border wears the permission mode: blue standard, yellow
+	// acceptEdits, red unrestricted — legible without reading the statusline.
+	inputBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(modeColor(m.mode)).
+		Width(m.width - 2).
+		Render(m.input.View())
+	parts = append(parts, inputBox)
+	if m.completion.visible {
+		parts = append(parts, m.renderCompletions())
+	}
+	if m.showHelp {
+		parts = append(parts, m.helpModel.FullHelpView(keys.FullHelp()))
+	}
+	parts = append(parts, m.statusline())
 	return strings.Join(parts, "\n")
 }
 
@@ -1260,32 +1503,6 @@ func indentLines(s, prefix string) string {
 
 // ── main ──
 
-// pickAgentInteractive lists agents on stdout and starts the chosen runtime.
-func pickAgentInteractive(cli *client.Client) error {
-	agents, err := cli.ListAgents(context.Background())
-	if err != nil {
-		return err
-	}
-	if len(agents) == 0 {
-		return fmt.Errorf("no agents on this server")
-	}
-	fmt.Println("agents:")
-	for i, a := range agents {
-		fmt.Printf("  [%d] %s  (%s)\n", i+1, a.Name, a.ID)
-	}
-	fmt.Print("select agent: ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil {
-		return err
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil || n < 1 || n > len(agents) {
-		return fmt.Errorf("invalid selection %q", strings.TrimSpace(line))
-	}
-	fmt.Printf("starting runtime for %s…\n", agents[n-1].Name)
-	return cli.StartRuntime(context.Background(), agents[n-1].ID)
-}
-
 func main() {
 	agentID := flag.String("agent", "", "agent id or name (required)")
 	conversationID := flag.String("conversation", "", "conversation id to resume (default: create new)")
@@ -1300,7 +1517,10 @@ func main() {
 	}
 	defer logFile.Close()
 
-	opts := client.Options{
+	// Connection, agent pick, and runtime start all happen inside the TUI
+	// (phase state machine) — no stdout preamble.
+	m := newModel(nil, logPath, *port, logFile)
+	m.startOpts = client.Options{
 		Agent:          *agentID,
 		ConversationID: *conversationID,
 		Port:           *port,
@@ -1308,39 +1528,12 @@ func main() {
 		ServerLog:      logFile,
 	}
 
-	var cli *client.Client
-	if *agentID == "" {
-		// No agent given: connect first, offer a picker on stdout.
-		fmt.Println("starting app-server…")
-		cli, err = client.Connect(context.Background(), opts)
-		if err == nil {
-			err = pickAgentInteractive(cli)
-		}
-	} else {
-		fmt.Printf("starting app-server and runtime for %s…\n", *agentID)
-		cli, err = client.Start(context.Background(), opts)
-	}
-	if err != nil {
-		if cli != nil {
-			cli.Close()
-		}
-		fmt.Fprintf(os.Stderr, "startup failed: %v\n(server log: %s)\n", err, logPath)
-		os.Exit(1)
-	}
-	defer cli.Close()
-
-	m := newModel(cli, logPath, *port, logFile)
-	if *conversationID != "" {
-		if msgs, err := cli.MessagesList(context.Background()); err == nil {
-			m.replayHistory(msgs)
-		} else {
-			m.appendEntry(&entry{kind: entryError, text: "history fetch failed: " + err.Error()})
-		}
-	}
-
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
 		os.Exit(1)
+	}
+	if m.cli != nil {
+		m.cli.Close()
 	}
 }
