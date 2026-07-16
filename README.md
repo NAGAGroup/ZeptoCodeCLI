@@ -9,9 +9,28 @@ commands (skill installs, provider setup, etc.) stay with the native `letta` CLI
 
 ## Status
 
-De-risking spike stage. `pixi run spike -- --agent <agent-id>` spawns a dedicated
-app-server on loopback, runs one turn against the given agent in a fresh conversation,
-and dumps every protocol frame to stdout.
+Milestone 1: interactive chat loop.
+
+```bash
+# The TUI: streaming transcript, input box, statusline, tool-approval modal
+pixi run zc -- --agent <agent-id> [--conversation <id>] [--mode standard]
+
+# Protocol frame dumper (debugging)
+pixi run spike -- --agent <agent-id> [--message "..."]
+
+# Headless end-to-end tests against a real app-server
+ZC_SMOKE_AGENT=<agent-id> pixi run smoke
+```
+
+Keys: `enter` send · `alt+enter` newline · `esc` abort turn · `a`/`d` approve/deny
+tool use · `ctrl+c` quit.
+
+Note on approvals: letta-code's server default permission mode is
+`unrestricted`; pass `--mode standard` if you want interactive tool approvals.
+Read-only shell commands are auto-allowed server-side in any mode. The
+`requires_approval` stop_reason is *not* terminal — the server emits it just
+before the `can_use_tool` control_request and resumes the turn after the
+client's decision.
 
 ## Requirements
 

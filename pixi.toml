@@ -17,5 +17,11 @@ uutils-coreutils = "*"
 [tasks]
 # Protocol de-risking spike: spawns a dedicated app-server, runs one turn, dumps frames.
 spike = "go run ./cmd/spike"
+# The TUI: pixi run zc -- --agent <agent-id>
+zc = "go run ./cmd/zc"
 tidy = "go mod tidy"
 build = "go build ./..."
+vet = "go vet ./..."
+# Headless client-package round-trip against a real app-server (needs letta on PATH):
+# ZC_SMOKE_AGENT=<agent-id> pixi run smoke
+smoke = "go test ./internal/client -run TestSmoke -v -count=1"

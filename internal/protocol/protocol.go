@@ -1,0 +1,279 @@
+// Package protocol implements the interactive-conversation subset of the
+// Letta Code app-server WebSocket protocol (protocol_v2).
+//
+// Source of truth: @letta-ai/letta-code/app-server-protocol (shipped .d.ts,
+// a 1:1 re-export of src/types/protocol_v2.ts). There is no wire-level
+// version negotiation; this package is written against letta-code 0.28.x.
+// On upstream bumps, diff the shipped .d.ts between npm versions for an
+// exact changelog.
+//
+// Decoding is deliberately tolerant: unknown frame types and unknown fields
+// are preserved or skipped, never fatal.
+package protocol
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// ── Shared scopes & enums ──
+
+type RuntimeScope struct {
+	AgentID        string `json:"agent_id"`
+	ConversationID string `json:"conversation_id"`
+	ActingUserID   string `json:"acting_user_id,omitempty"`
+}
+
+type PermissionMode string
+
+const (
+	ModeStandard     PermissionMode = "standard"
+	ModeAcceptEdits  PermissionMode = "acceptEdits"
+	ModeUnrestricted PermissionMode = "unrestricted"
+)
+
+// LoopStatus values (LoopStatus union in protocol_v2).
+const (
+	LoopSendingAPIRequest   = "SENDING_API_REQUEST"
+	LoopWaitingForResponse  = "WAITING_FOR_API_RESPONSE"
+	LoopRetryingAPIRequest  = "RETRYING_API_REQUEST"
+	LoopProcessingResponse  = "PROCESSING_API_RESPONSE"
+	LoopExecutingClientTool = "EXECUTING_CLIENT_SIDE_TOOL"
+	LoopExecutingCommand    = "EXECUTING_COMMAND"
+	LoopWaitingOnApproval   = "WAITING_ON_APPROVAL"
+	LoopWaitingOnInput      = "WAITING_ON_INPUT"
+)
+
+type LoopState struct {
+	Status               string   `json:"status"`
+	ActiveRunIDs         []string `json:"active_run_ids"`
+	ExecutingToolCallIDs []string `json:"executing_tool_call_ids"`
+}
+
+// ── Outbound commands (client → app-server, control channel) ──
+
+type ClientInfo struct {
+	Name    string `json:"name"`
+	Title   string `json:"title,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+type CreateConversationOptions struct {
+	Body map[string]any `json:"body"`
+}
+
+type RuntimeStartCommand struct {
+	Type               string                     `json:"type"` // "runtime_start"
+	RequestID          string                     `json:"request_id"`
+	AgentID            string                     `json:"agent_id,omitempty"`
+	ConversationID     string                     `json:"conversation_id,omitempty"`
+	CreateConversation *CreateConversationOptions `json:"create_conversation,omitempty"`
+	Mode               PermissionMode             `json:"mode,omitempty"`
+	ClientInfo         *ClientInfo                `json:"client_info,omitempty"`
+}
+
+type MessageCreate struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type InputCreateMessage struct {
+	Type    string       `json:"type"` // "input"
+	Runtime RuntimeScope `json:"runtime"`
+	Payload struct {
+		Kind     string          `json:"kind"` // "create_message"
+		Messages []MessageCreate `json:"messages"`
+	} `json:"payload"`
+}
+
+func NewUserMessage(rt RuntimeScope, text string) InputCreateMessage {
+	cmd := InputCreateMessage{Type: "input", Runtime: rt}
+	cmd.Payload.Kind = "create_message"
+	cmd.Payload.Messages = []MessageCreate{{Role: "user", Content: text}}
+	return cmd
+}
+
+// ApprovalDecision is either allow (optional updated input / persisted
+// permission suggestions) or deny (message required by the protocol).
+type ApprovalDecision struct {
+	Behavior                         string         `json:"behavior"` // "allow" | "deny"
+	Message                          string         `json:"message,omitempty"`
+	UpdatedInput                     map[string]any `json:"updated_input,omitempty"`
+	SelectedPermissionSuggestionIDs  []string       `json:"selected_permission_suggestion_ids,omitempty"`
+}
+
+type InputApprovalResponse struct {
+	Type    string       `json:"type"` // "input"
+	Runtime RuntimeScope `json:"runtime"`
+	Payload struct {
+		Kind      string           `json:"kind"` // "approval_response"
+		RequestID string           `json:"request_id"`
+		Decision  ApprovalDecision `json:"decision"`
+	} `json:"payload"`
+}
+
+func NewApprovalResponse(rt RuntimeScope, requestID string, decision ApprovalDecision) InputApprovalResponse {
+	cmd := InputApprovalResponse{Type: "input", Runtime: rt}
+	cmd.Payload.Kind = "approval_response"
+	cmd.Payload.RequestID = requestID
+	cmd.Payload.Decision = decision
+	return cmd
+}
+
+type AbortMessageCommand struct {
+	Type      string       `json:"type"` // "abort_message"
+	Runtime   RuntimeScope `json:"runtime"`
+	RequestID string       `json:"request_id,omitempty"`
+}
+
+// ── Inbound frames (app-server → client) ──
+
+// Frame is a decoded inbound frame. Exactly one typed field is non-nil;
+// Raw always holds the original JSON.
+type Frame struct {
+	Type      string
+	RequestID string
+	Raw       json.RawMessage
+
+	RuntimeStartResponse *RuntimeStartResponse
+	ControlRequest       *ControlRequest
+	StreamDelta          *StreamDeltaMessage
+	LoopStatus           *LoopStatusUpdate
+	DeviceStatus         *DeviceStatusUpdate
+}
+
+type RuntimeStartResponse struct {
+	Success bool          `json:"success"`
+	Error   string        `json:"error"`
+	Runtime *RuntimeScope `json:"runtime"`
+}
+
+type PermissionSuggestion struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
+}
+
+type ControlRequestBody struct {
+	Subtype               string                 `json:"subtype"` // "can_use_tool"
+	ToolName              string                 `json:"tool_name"`
+	Input                 map[string]any         `json:"input"`
+	ToolCallID            string                 `json:"tool_call_id"`
+	PermissionSuggestions []PermissionSuggestion `json:"permission_suggestions"`
+	BlockedPath           *string                `json:"blocked_path"`
+}
+
+type ControlRequest struct {
+	RequestID      string             `json:"request_id"`
+	Request        ControlRequestBody `json:"request"`
+	AgentID        string             `json:"agent_id"`
+	ConversationID string             `json:"conversation_id"`
+}
+
+// Delta is a tolerant union of every stream_delta message type we render:
+// Letta streaming messages (assistant/reasoning/tool call/return/stop_reason)
+// plus UMI lifecycle events (client tool + command + status/retry/loop_error).
+type Delta struct {
+	ID          string          `json:"id"`
+	MessageType string          `json:"message_type"`
+	Content     json.RawMessage `json:"content"`   // string | [{type:"text",text}]
+	Reasoning   string          `json:"reasoning"` // reasoning_message
+	StopReason  string          `json:"stop_reason"`
+	RunID       string          `json:"run_id"`
+
+	// tool_call_message (letta streaming): arguments stream incrementally.
+	ToolCall *struct {
+		Name       string `json:"name"`
+		Arguments  string `json:"arguments"`
+		ToolCallID string `json:"tool_call_id"`
+	} `json:"tool_call"`
+	// tool_return_message
+	ToolReturn json.RawMessage `json:"tool_return"`
+	Status     string          `json:"status"` // tool_return_message | client_tool_end
+	ToolCallID string          `json:"tool_call_id"`
+	ToolName   string          `json:"tool_name"` // client_tool_start
+	ToolArgs   string          `json:"tool_args"`
+
+	// command / slash command lifecycle + status / retry / loop_error
+	Input   string `json:"input"`
+	Output  string `json:"output"`
+	Message string `json:"message"`
+	Level   string `json:"level"`
+}
+
+type StreamDeltaMessage struct {
+	Runtime    RuntimeScope `json:"runtime"`
+	Delta      Delta        `json:"delta"`
+	SubagentID string       `json:"subagent_id"`
+	EventSeq   int64        `json:"event_seq"`
+}
+
+type LoopStatusUpdate struct {
+	Runtime    RuntimeScope `json:"runtime"`
+	LoopStatus LoopState    `json:"loop_status"`
+}
+
+type DeviceStatusUpdate struct {
+	Runtime      RuntimeScope `json:"runtime"`
+	DeviceStatus struct {
+		ConnectionName string         `json:"connection_name"`
+		Mode           PermissionMode `json:"mode"`
+		CWD            string         `json:"cwd"`
+	} `json:"device_status"`
+}
+
+// Decode parses an inbound frame. Unknown types yield a Frame with only
+// Type/Raw set — callers should skip what they do not understand.
+func Decode(raw []byte) (Frame, error) {
+	var head struct {
+		Type      string `json:"type"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return Frame{}, fmt.Errorf("frame header: %w", err)
+	}
+	f := Frame{Type: head.Type, RequestID: head.RequestID, Raw: append([]byte(nil), raw...)}
+	var err error
+	switch head.Type {
+	case "runtime_start_response":
+		f.RuntimeStartResponse = &RuntimeStartResponse{}
+		err = json.Unmarshal(raw, f.RuntimeStartResponse)
+	case "control_request":
+		f.ControlRequest = &ControlRequest{}
+		err = json.Unmarshal(raw, f.ControlRequest)
+	case "stream_delta":
+		f.StreamDelta = &StreamDeltaMessage{}
+		err = json.Unmarshal(raw, f.StreamDelta)
+	case "update_loop_status":
+		f.LoopStatus = &LoopStatusUpdate{}
+		err = json.Unmarshal(raw, f.LoopStatus)
+	case "update_device_status":
+		f.DeviceStatus = &DeviceStatusUpdate{}
+		err = json.Unmarshal(raw, f.DeviceStatus)
+	}
+	return f, err
+}
+
+// Text renders delta content that may be a plain string or a list of
+// {type:"text", text:"..."} parts.
+func (d *Delta) Text() string {
+	if len(d.Content) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(d.Content, &s); err == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(d.Content, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return ""
+}
