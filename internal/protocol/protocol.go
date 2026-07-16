@@ -264,11 +264,13 @@ type Frame struct {
 
 type ConversationSummary struct {
 	ID            string `json:"id"`
+	AgentID       string `json:"agent_id"`
 	Title         string `json:"title"`
 	Summary       string `json:"summary"`
 	CreatedAt     string `json:"created_at"`
 	UpdatedAt     string `json:"updated_at"`
 	LastMessageAt string `json:"last_message_at"`
+	Archived      bool   `json:"archived"`
 }
 
 type ConversationListResponse struct {

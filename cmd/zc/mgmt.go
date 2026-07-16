@@ -1257,3 +1257,67 @@ func resolveCronRef(cli interface {
 		return "", fmt.Errorf("cron name %q is ambiguous (%d tasks) — use the id", ref, len(matches))
 	}
 }
+
+// ── /tidy ──
+//
+// Archives never-used conversations (last_message_at null) across ALL agents.
+// Every zc/native launch that creates-then-abandons a conversation leaves one
+// behind; they clutter pickers and resume to a blank transcript. Archiving
+// sets archived+hidden via conversation_update — reversible (the local
+// backend lists hidden conversations with include_hidden=true).
+
+func cmdTidy(m *model, _ string) tea.Cmd {
+	cli := m.cli
+	current := cli.Runtime.ConversationID
+	return func() tea.Msg {
+		agents, err := cli.ListAgents(context.Background())
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/tidy"}
+		}
+		var victims []protocol.ConversationSummary
+		agentsHit := map[string]bool{}
+		for _, a := range agents {
+			convs, err := cli.ConversationsListFor(context.Background(), a.ID)
+			if err != nil {
+				return mgmtMsg{err: fmt.Errorf("%s: %w", a.Name, err), errWrap: "/tidy"}
+			}
+			for _, c := range convs {
+				if c.Archived || c.LastMessageAt != "" || c.ID == current {
+					continue
+				}
+				victims = append(victims, c)
+				agentsHit[a.ID] = true
+			}
+		}
+		if len(victims) == 0 {
+			return mgmtMsg{infoTxt: "tidy: no empty conversations found"}
+		}
+		ok := false
+		mf := &mgmtForm{title: "tidy"}
+		mf.form = form.New(
+			form.NewConfirm(fmt.Sprintf("archive %d empty conversation(s) across %d agent(s)?",
+				len(victims), len(agentsHit))).
+				Affirmative("archive").Negative("cancel").Value(&ok),
+		)
+		mf.onDone = func(m *model) tea.Cmd {
+			if !ok {
+				m.appendEntry(&entry{kind: entryInfo, text: "tidy cancelled"})
+				return nil
+			}
+			cli := m.cli
+			return func() tea.Msg {
+				n := 0
+				for _, v := range victims {
+					err := cli.UpdateConversationByID(context.Background(), v.ID,
+						map[string]any{"archived": true, "hidden": true})
+					if err != nil {
+						return mgmtMsg{err: fmt.Errorf("%s (archived %d before failing): %w", v.ID, n, err), errWrap: "/tidy"}
+					}
+					n++
+				}
+				return mgmtMsg{infoTxt: fmt.Sprintf("tidy: archived %d empty conversation(s) across %d agent(s)", n, len(agentsHit))}
+			}
+		}
+		return mgmtMsg{form: mf}
+	}
+}

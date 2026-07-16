@@ -504,10 +504,16 @@ func (c *Client) Fork(ctx context.Context) (string, error) {
 
 // UpdateConversation patches the current conversation (e.g. {"title": ...}).
 func (c *Client) UpdateConversation(ctx context.Context, body map[string]any) error {
+	return c.UpdateConversationByID(ctx, c.Runtime.ConversationID, body)
+}
+
+// UpdateConversationByID patches any conversation by id — needed for
+// cross-conversation maintenance like /tidy (archiving empties).
+func (c *Client) UpdateConversationByID(ctx context.Context, conversationID string, body map[string]any) error {
 	cmd := protocol.ConversationUpdateCommand{
 		Type:           "conversation_update",
 		RequestID:      c.nextRequestID(),
-		ConversationID: c.Runtime.ConversationID,
+		ConversationID: conversationID,
 		Body:           body,
 	}
 	_, err := c.ackRequest(ctx, cmd.RequestID, cmd)

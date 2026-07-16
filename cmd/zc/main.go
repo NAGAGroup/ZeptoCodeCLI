@@ -314,6 +314,9 @@ func (m *model) startupConvPicker(agentID string) tea.Cmd {
 		}
 		items := []overlayItem{{id: "", title: "(new conversation)"}}
 		for _, c := range convs {
+			if c.Archived {
+				continue
+			}
 			title := c.Title
 			if title == "" {
 				title = c.Summary
@@ -1264,6 +1267,7 @@ var clientCommands = []clientCommand{
 	{"mcp", "MCP status (not wireable on local backend)", cmdMCP},
 	{"profiles", "agent profiles: /profiles [list] | save <name> | rm <name>", cmdProfiles},
 	{"crons", "cron tasks: /crons [list] | trigger <ref> | rm <ref>", cmdCrons},
+	{"tidy", "archive empty conversations across all agents", cmdTidy},
 	{"help", "toggle keybinding help", func(m *model, _ string) tea.Cmd {
 		m.showHelp = !m.showHelp
 		m.layout()
@@ -1284,6 +1288,9 @@ func (m *model) openConversationPicker() tea.Cmd {
 		}
 		items := []overlayItem{{id: "", title: "(new conversation)"}}
 		for _, c := range convs {
+			if c.Archived {
+				continue
+			}
 			title := c.Title
 			if title == "" {
 				title = c.Summary
