@@ -396,6 +396,10 @@ func NewText(title string) *Text {
 	ta := textarea.New()
 	ta.ShowLineNumbers = false
 	ta.SetHeight(8)
+	// Clear the v2 default cursor-line background (harsh black block).
+	st := ta.Styles()
+	st.Focused.CursorLine = lipgloss.NewStyle()
+	ta.SetStyles(st)
 	return &Text{base: base{title: title}, ta: ta}
 }
 

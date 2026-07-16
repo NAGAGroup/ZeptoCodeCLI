@@ -183,6 +183,13 @@ func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) 
 	ta.Prompt = ""
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
+	// v2 defaults paint the cursor line with a harsh black background —
+	// clear it and dim the placeholder to the theme.
+	st := ta.Styles()
+	st.Focused.CursorLine = lipgloss.NewStyle()
+	st.Focused.Placeholder = lipgloss.NewStyle().Foreground(theme.Dim)
+	st.Blurred.Placeholder = lipgloss.NewStyle().Foreground(theme.Dim)
+	ta.SetStyles(st)
 	ta.Focus()
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
@@ -741,6 +748,16 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, nil
+	}
+
+	// Help dialog closes on esc/q (lowest-priority modal).
+	if m.showHelp {
+		switch msg.String() {
+		case "esc", "q", "ctrl+g":
+			m.showHelp = false
+			m.layout()
+			return m, nil
+		}
 	}
 
 	switch msg.String() {
@@ -1662,9 +1679,6 @@ func (m *model) extraHeight() int {
 	if act := m.activityLines(); act != "" {
 		h += lipgloss.Height(act)
 	}
-	if m.showHelp {
-		h += lipgloss.Height(m.helpModel.FullHelpView(keys.FullHelp()))
-	}
 	return h
 }
 
@@ -1993,12 +2007,6 @@ func (m *model) viewContent() string {
 		Width(m.width - 2).
 		Render(m.input.View())
 	parts = append(parts, inputBox)
-	helpH := 0
-	if m.showHelp {
-		hv := m.helpModel.FullHelpView(keys.FullHelp())
-		parts = append(parts, hv)
-		helpH = lipgloss.Height(hv)
-	}
 	parts = append(parts, m.statusline())
 	base := strings.Join(parts, "\n")
 
@@ -2009,7 +2017,7 @@ func (m *model) viewContent() string {
 	// Completions float anchored just above the input box.
 	if m.completion.visible {
 		box := styleOverlay.Render(m.renderCompletions())
-		y := m.height - 1 - helpH - lipgloss.Height(inputBox) - lipgloss.Height(box)
+		y := m.height - 1 - lipgloss.Height(inputBox) - lipgloss.Height(box)
 		return compositeAt(base, box, 1, y)
 	}
 	return base

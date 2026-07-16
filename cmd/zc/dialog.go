@@ -48,6 +48,9 @@ func (m *model) activeDialog() string {
 		return m.overlay.render(w, 18)
 	case len(m.approvals) > 0:
 		return m.renderModal()
+	case m.showHelp:
+		return dialogBox("keybindings", "esc or ctrl+g closes",
+			m.helpModel.FullHelpView(keys.FullHelp()), w)
 	}
 	return ""
 }
