@@ -293,6 +293,30 @@ func (c *Client) runtimeStart(ctx context.Context, agentID string) error {
 	return nil
 }
 
+// MessagesList fetches the conversation transcript (LettaMessage history).
+func (c *Client) MessagesList(ctx context.Context) ([]protocol.Delta, error) {
+	cmd := protocol.ConversationMessagesListCommand{
+		Type:           "conversation_messages_list",
+		RequestID:      c.nextRequestID(),
+		ConversationID: c.Runtime.ConversationID,
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, cmd.RequestID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("client: conversation_messages_list: %w", err)
+	}
+	resp := f.MessagesList
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil && resp.Error != "" {
+			msg = resp.Error
+		}
+		return nil, fmt.Errorf("client: conversation_messages_list failed: %s", msg)
+	}
+	return resp.Messages, nil
+}
+
 // SendUserMessage submits a user turn.
 func (c *Client) SendUserMessage(text string) error {
 	return c.send(protocol.NewUserMessage(c.Runtime, text))

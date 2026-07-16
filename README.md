@@ -9,7 +9,10 @@ commands (skill installs, provider setup, etc.) stay with the native `letta` CLI
 
 ## Status
 
-Milestone 1: interactive chat loop.
+Milestone 2: daily-drivable chat client — markdown rendering (glamour),
+conversation resume with history replay, diff previews + "always allow"
+permission suggestions in the approval modal, approval recovery on resume,
+input history, `--agent` by name or id.
 
 ```bash
 # The TUI: streaming transcript, input box, statusline, tool-approval modal
@@ -22,8 +25,9 @@ pixi run spike -- --agent <agent-id> [--message "..."]
 ZC_SMOKE_AGENT=<agent-id> pixi run smoke
 ```
 
-Keys: `enter` send · `alt+enter` newline · `esc` abort turn · `a`/`d` approve/deny
-tool use · `ctrl+c` quit.
+Keys: `enter` send · `alt+enter` newline · `up`/`down` input history · `esc`
+abort turn · `a`/`d` approve/deny tool use · `1`–`9` approve + persist the
+matching permission suggestion · `pgup`/`pgdn` scroll · `ctrl+c` quit.
 
 Note on approvals: letta-code's server default permission mode is
 `unrestricted`; pass `--mode standard` if you want interactive tool approvals.

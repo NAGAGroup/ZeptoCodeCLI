@@ -132,6 +132,13 @@ type AgentListCommand struct {
 	RequestID string `json:"request_id"`
 }
 
+type ConversationMessagesListCommand struct {
+	Type           string         `json:"type"` // "conversation_messages_list"
+	RequestID      string         `json:"request_id"`
+	ConversationID string         `json:"conversation_id"`
+	Query          map[string]any `json:"query,omitempty"`
+}
+
 // ── Inbound frames (app-server → client) ──
 
 // Frame is a decoded inbound frame. Exactly one typed field is non-nil;
@@ -147,6 +154,7 @@ type Frame struct {
 	LoopStatus           *LoopStatusUpdate
 	DeviceStatus         *DeviceStatusUpdate
 	AgentList            *AgentListResponse
+	MessagesList         *ConversationMessagesListResponse
 }
 
 type AgentSummary struct {
@@ -160,6 +168,15 @@ type AgentListResponse struct {
 	Agents  []AgentSummary `json:"agents"`
 }
 
+// ConversationMessagesListResponse carries history as LettaMessage objects,
+// which share the message_type discrimination of stream deltas — Delta
+// decodes them.
+type ConversationMessagesListResponse struct {
+	Success  bool    `json:"success"`
+	Error    string  `json:"error"`
+	Messages []Delta `json:"messages"`
+}
+
 type RuntimeStartResponse struct {
 	Success bool          `json:"success"`
 	Error   string        `json:"error"`
@@ -171,6 +188,28 @@ type PermissionSuggestion struct {
 	Text string `json:"text"`
 }
 
+type DiffHunkLine struct {
+	Type    string `json:"type"` // "context" | "add" | "remove"
+	Content string `json:"content"`
+}
+
+type DiffHunk struct {
+	OldStart int            `json:"oldStart"`
+	OldLines int            `json:"oldLines"`
+	NewStart int            `json:"newStart"`
+	NewLines int            `json:"newLines"`
+	Lines    []DiffHunkLine `json:"lines"`
+}
+
+// DiffPreview: mode "advanced" carries hunks; "fallback"/"unpreviewable"
+// carry a reason.
+type DiffPreview struct {
+	Mode     string     `json:"mode"`
+	FileName string     `json:"fileName"`
+	Hunks    []DiffHunk `json:"hunks"`
+	Reason   string     `json:"reason"`
+}
+
 type ControlRequestBody struct {
 	Subtype               string                 `json:"subtype"` // "can_use_tool"
 	ToolName              string                 `json:"tool_name"`
@@ -178,6 +217,7 @@ type ControlRequestBody struct {
 	ToolCallID            string                 `json:"tool_call_id"`
 	PermissionSuggestions []PermissionSuggestion `json:"permission_suggestions"`
 	BlockedPath           *string                `json:"blocked_path"`
+	Diffs                 []DiffPreview          `json:"diffs"`
 }
 
 type ControlRequest struct {
@@ -192,6 +232,7 @@ type ControlRequest struct {
 // plus UMI lifecycle events (client tool + command + status/retry/loop_error).
 type Delta struct {
 	ID          string          `json:"id"`
+	Date        string          `json:"date"` // ISO timestamp; used to normalize history order
 	MessageType string          `json:"message_type"`
 	Content     json.RawMessage `json:"content"`   // string | [{type:"text",text}]
 	Reasoning   string          `json:"reasoning"` // reasoning_message
@@ -277,6 +318,9 @@ func Decode(raw []byte) (Frame, error) {
 	case "agent_list_response":
 		f.AgentList = &AgentListResponse{}
 		err = json.Unmarshal(raw, f.AgentList)
+	case "conversation_messages_list_response":
+		f.MessagesList = &ConversationMessagesListResponse{}
+		err = json.Unmarshal(raw, f.MessagesList)
 	}
 	return f, err
 }

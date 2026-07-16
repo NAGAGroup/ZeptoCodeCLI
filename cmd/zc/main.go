@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/client"
@@ -45,6 +46,10 @@ type entry struct {
 	toolCallID string
 	toolArgs   strings.Builder
 	toolStatus string // "", "running", "success", "error", "denied", "allowed"
+	// render cache (assistant markdown is expensive)
+	cachedRender string
+	cachedWidth  int
+	cachedLen    int
 }
 
 // ── tea messages ──
@@ -102,6 +107,14 @@ type model struct {
 	connected  bool
 	quitting   bool
 	lastModalH int
+
+	markdown      *glamour.TermRenderer
+	markdownWidth int
+
+	history    []string // sent messages, for up/down recall
+	historyIdx int      // len(history) == "not navigating"
+
+	seenApprovals map[string]bool // control_request request_ids already queued
 }
 
 func newModel(cli *client.Client, logPath string) *model {
@@ -112,13 +125,50 @@ func newModel(cli *client.Client, logPath string) *model {
 	ta.ShowLineNumbers = false
 	ta.Focus()
 	return &model{
-		cli:          cli,
-		logPath:      logPath,
-		input:        ta,
-		toolByCallID: map[string]*entry{},
-		loopStatus:   protocol.LoopWaitingOnInput,
-		mode:         "?", // real mode arrives via update_device_status
-		connected:    true,
+		cli:           cli,
+		logPath:       logPath,
+		input:         ta,
+		toolByCallID:  map[string]*entry{},
+		loopStatus:    protocol.LoopWaitingOnInput,
+		mode:          "?", // real mode arrives via update_device_status
+		connected:     true,
+		seenApprovals: map[string]bool{},
+	}
+}
+
+// replayHistory renders past conversation messages into transcript entries.
+// Unlike live deltas, each history message is complete, so streaming
+// aggregation is closed after every message.
+func (m *model) replayHistory(msgs []protocol.Delta) {
+	// The messages API returns newest-first; normalize to chronological
+	// using the date field rather than trusting the default order.
+	if len(msgs) > 1 && msgs[0].Date > msgs[len(msgs)-1].Date {
+		for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+			msgs[i], msgs[j] = msgs[j], msgs[i]
+		}
+	}
+	for i := range msgs {
+		d := &msgs[i]
+		switch d.MessageType {
+		case "user_message":
+			text := strings.TrimSpace(d.Text())
+			if text == "" || strings.HasPrefix(text, "<system-reminder>") {
+				continue // heartbeats / injected reminders, not the user
+			}
+			m.appendEntry(&entry{kind: entryUser, text: text})
+		case "assistant_message":
+			if text := d.Text(); strings.TrimSpace(text) != "" {
+				m.appendEntry(&entry{kind: entryAssistant, text: text})
+			}
+		case "tool_call_message", "tool_return_message", "client_tool_start",
+			"client_tool_end", "approval_request_message":
+			m.handleDelta(d)
+			m.closeStreaming()
+		}
+		// reasoning, system, usage, stop_reason: skipped on replay
+	}
+	if len(m.entries) > 0 {
+		m.appendEntry(&entry{kind: entryInfo, text: "── conversation resumed ──"})
 	}
 }
 
@@ -159,7 +209,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Approval modal swallows keys first.
 	if len(m.approvals) > 0 {
 		req := m.approvals[0]
-		switch msg.String() {
+		key := msg.String()
+		switch key {
 		case "a", "y":
 			m.resolveApproval(req, protocol.ApprovalDecision{Behavior: "allow"})
 			return m, nil
@@ -172,6 +223,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
+		}
+		// Number keys: allow + persist the matching permission suggestion.
+		if n := int(key[0] - '0'); len(key) == 1 && n >= 1 && n <= len(req.Request.PermissionSuggestions) {
+			s := req.Request.PermissionSuggestions[n-1]
+			m.resolveApproval(req, protocol.ApprovalDecision{
+				Behavior:                        "allow",
+				SelectedPermissionSuggestionIDs: []string{s.ID},
+			})
+			return m, nil
 		}
 		return m, nil
 	}
@@ -193,6 +253,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.input.Reset()
+		m.history = append(m.history, text)
+		m.historyIdx = len(m.history)
 		m.closeStreaming()
 		m.appendEntry(&entry{kind: entryUser, text: text})
 		if err := m.cli.SendUserMessage(text); err != nil {
@@ -203,7 +265,28 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "alt+enter":
 		m.input.InsertString("\n")
 		return m, nil
-	case "pgup", "pgdown", "up", "down":
+	case "up":
+		// History recall when the input is empty or already navigating.
+		if len(m.history) > 0 && (m.input.Value() == "" || m.historyIdx < len(m.history)) {
+			if m.historyIdx > 0 {
+				m.historyIdx--
+			}
+			m.input.SetValue(m.history[m.historyIdx])
+			m.input.CursorEnd()
+			return m, nil
+		}
+	case "down":
+		if m.historyIdx < len(m.history) {
+			m.historyIdx++
+			if m.historyIdx == len(m.history) {
+				m.input.Reset()
+			} else {
+				m.input.SetValue(m.history[m.historyIdx])
+				m.input.CursorEnd()
+			}
+			return m, nil
+		}
+	case "pgup", "pgdown":
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		return m, cmd
@@ -223,10 +306,9 @@ func (m *model) resolveApproval(req *protocol.ControlRequest, decision protocol.
 	if decision.Behavior == "deny" {
 		verdict = "denied"
 	}
+	// enqueueApproval guarantees the tool entry exists.
 	if e, ok := m.toolByCallID[req.Request.ToolCallID]; ok {
 		e.toolStatus = verdict
-	} else {
-		m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf("%s %s", verdict, req.Request.ToolName)})
 	}
 	m.refreshViewport()
 }
@@ -236,18 +318,49 @@ func (m *model) resolveApproval(req *protocol.ControlRequest, decision protocol.
 func (m *model) handleFrame(f protocol.Frame) {
 	switch {
 	case f.ControlRequest != nil && f.ControlRequest.Request.Subtype == "can_use_tool":
-		m.approvals = append(m.approvals, f.ControlRequest)
+		m.enqueueApproval(f.ControlRequest)
 
 	case f.LoopStatus != nil:
 		m.loopStatus = f.LoopStatus.LoopStatus.Status
 
 	case f.DeviceStatus != nil:
-		if f.DeviceStatus.DeviceStatus.Mode != "" {
-			m.mode = f.DeviceStatus.DeviceStatus.Mode
+		ds := &f.DeviceStatus.DeviceStatus
+		if ds.Mode != "" {
+			m.mode = ds.Mode
+		}
+		// Approval recovery: a resumed conversation may have approvals that
+		// were pending when the previous client went away.
+		for i := range ds.PendingControlRequests {
+			p := &ds.PendingControlRequests[i]
+			m.enqueueApproval(&protocol.ControlRequest{
+				RequestID: p.RequestID,
+				Request:   p.Request,
+			})
 		}
 
 	case f.StreamDelta != nil:
 		m.handleDelta(&f.StreamDelta.Delta)
+	}
+}
+
+// enqueueApproval queues a can_use_tool request (idempotent by request_id)
+// and materializes its tool entry so approval state renders in the
+// transcript, not as a detached info line.
+func (m *model) enqueueApproval(req *protocol.ControlRequest) {
+	if req.RequestID == "" || m.seenApprovals[req.RequestID] {
+		return
+	}
+	m.seenApprovals[req.RequestID] = true
+	m.approvals = append(m.approvals, req)
+	id := req.Request.ToolCallID
+	if _, ok := m.toolByCallID[id]; !ok && id != "" {
+		m.closeStreaming()
+		e := &entry{kind: entryTool, toolCallID: id, toolName: req.Request.ToolName, toolStatus: "awaiting approval"}
+		if args, err := json.Marshal(req.Request.Input); err == nil {
+			e.toolArgs.Write(args)
+		}
+		m.toolByCallID[id] = e
+		m.appendEntry(e)
 	}
 }
 
@@ -287,6 +400,30 @@ func (m *model) handleDelta(d *protocol.Delta) {
 		if d.ToolCall.Name != "" {
 			e.toolName = d.ToolCall.Name
 		}
+		e.toolArgs.WriteString(d.ToolCall.Arguments)
+
+	case "approval_request_message":
+		// A complete tool call awaiting approval (streams live before the
+		// control_request; also how approval-gated calls appear in history).
+		m.closeStreaming()
+		if d.ToolCall == nil {
+			return
+		}
+		id := d.ToolCall.ToolCallID
+		e, ok := m.toolByCallID[id]
+		if !ok && id != "" {
+			e = &entry{kind: entryTool, toolCallID: id, toolStatus: "awaiting approval"}
+			m.toolByCallID[id] = e
+			m.appendEntry(e)
+		}
+		if e == nil {
+			return
+		}
+		if d.ToolCall.Name != "" {
+			e.toolName = d.ToolCall.Name
+		}
+		// Arguments here are complete: replace anything streamed so far.
+		e.toolArgs.Reset()
 		e.toolArgs.WriteString(d.ToolCall.Arguments)
 
 	case "tool_return_message":
@@ -392,6 +529,47 @@ func (m *model) layoutIfModalChanged() {
 	}
 }
 
+// markdownRenderer returns a width-matched glamour renderer, rebuilt on
+// resize.
+func (m *model) markdownRenderer(width int) *glamour.TermRenderer {
+	if m.markdown != nil && m.markdownWidth == width {
+		return m.markdown
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(width),
+		glamour.WithEmoji(),
+	)
+	if err != nil {
+		return nil
+	}
+	m.markdown = r
+	m.markdownWidth = width
+	return r
+}
+
+// renderAssistant renders markdown with a per-entry cache: only the entry
+// whose text grew (the streaming one) pays the glamour cost per frame.
+func (m *model) renderAssistant(e *entry, width int) string {
+	if e.cachedWidth == width && e.cachedLen == len(e.text) && e.cachedRender != "" {
+		return e.cachedRender
+	}
+	out := ""
+	if r := m.markdownRenderer(width); r != nil {
+		if rendered, err := r.Render(e.text); err == nil {
+			out = strings.Trim(rendered, "\n")
+		}
+	}
+	if out == "" {
+		out = e.text
+	}
+	out = styleAgent.Render("agent ▸") + "\n" + out
+	e.cachedRender = out
+	e.cachedWidth = width
+	e.cachedLen = len(e.text)
+	return out
+}
+
 func (m *model) renderTranscript() string {
 	w := m.width
 	if w <= 0 {
@@ -404,7 +582,7 @@ func (m *model) renderTranscript() string {
 		case entryUser:
 			b.WriteString(wrap.Render(styleUser.Render("you ▸ ") + e.text))
 		case entryAssistant:
-			b.WriteString(wrap.Render(styleAgent.Render("agent ▸ ") + e.text))
+			b.WriteString(m.renderAssistant(e, w-2))
 		case entryReasoning:
 			b.WriteString(wrap.Render(styleReasoning.Render("· " + e.text)))
 		case entryTool:
@@ -427,24 +605,75 @@ func (m *model) renderToolLine(e *entry) string {
 		return styleToolOK.Render(label + " ✓")
 	case "error", "denied":
 		return styleToolErr.Render(label + " ✗ " + e.toolStatus)
+	case "awaiting approval":
+		return styleTool.Render(label + " ⏸ awaiting approval")
 	default:
 		return styleTool.Render(label + " …")
 	}
 }
 
+var (
+	styleDiffAdd    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	styleDiffRemove = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleDiffCtx    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+)
+
+func renderDiffs(diffs []protocol.DiffPreview, maxLines int) string {
+	var b strings.Builder
+	lines := 0
+	for _, d := range diffs {
+		b.WriteString(styleInfo.Render("── "+d.FileName+" ──") + "\n")
+		if d.Mode != "advanced" {
+			b.WriteString(styleDiffCtx.Render("(no preview: "+d.Reason+")") + "\n")
+			continue
+		}
+		for _, h := range d.Hunks {
+			for _, l := range h.Lines {
+				if lines >= maxLines {
+					b.WriteString(styleDiffCtx.Render("…") + "\n")
+					return b.String()
+				}
+				switch l.Type {
+				case "add":
+					b.WriteString(styleDiffAdd.Render("+ "+l.Content) + "\n")
+				case "remove":
+					b.WriteString(styleDiffRemove.Render("- "+l.Content) + "\n")
+				default:
+					b.WriteString(styleDiffCtx.Render("  "+l.Content) + "\n")
+				}
+				lines++
+			}
+		}
+	}
+	return b.String()
+}
+
 func (m *model) renderModal() string {
 	req := m.approvals[0]
-	input, _ := json.MarshalIndent(req.Request.Input, "", "  ")
-	inputStr := string(input)
-	if lines := strings.Split(inputStr, "\n"); len(lines) > 12 {
-		inputStr = strings.Join(lines[:12], "\n") + "\n…"
+
+	var detail string
+	if len(req.Request.Diffs) > 0 {
+		detail = strings.TrimRight(renderDiffs(req.Request.Diffs, 16), "\n")
+	} else {
+		input, _ := json.MarshalIndent(req.Request.Input, "", "  ")
+		detail = string(input)
+		if lines := strings.Split(detail, "\n"); len(lines) > 12 {
+			detail = strings.Join(lines[:12], "\n") + "\n…"
+		}
 	}
+
 	queued := ""
 	if n := len(m.approvals) - 1; n > 0 {
 		queued = fmt.Sprintf("  (+%d queued)", n)
 	}
-	body := fmt.Sprintf("%s wants to run %s%s\n\n%s\n\n[a]llow   [d]eny",
-		"agent", styleTool.Render(req.Request.ToolName), queued, inputStr)
+
+	options := "[a]llow   [d]eny"
+	for i, s := range req.Request.PermissionSuggestions {
+		options += fmt.Sprintf("   [%d] %s", i+1, s.Text)
+	}
+
+	body := fmt.Sprintf("agent wants to run %s%s\n\n%s\n\n%s",
+		styleTool.Render(req.Request.ToolName), queued, detail, options)
 	w := m.width - 4
 	if w < 20 {
 		w = 20
@@ -535,7 +764,16 @@ func main() {
 	}
 	defer cli.Close()
 
-	p := tea.NewProgram(newModel(cli, logPath), tea.WithAltScreen())
+	m := newModel(cli, logPath)
+	if *conversationID != "" {
+		if msgs, err := cli.MessagesList(context.Background()); err == nil {
+			m.replayHistory(msgs)
+		} else {
+			m.appendEntry(&entry{kind: entryError, text: "history fetch failed: " + err.Error()})
+		}
+	}
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
 		os.Exit(1)
