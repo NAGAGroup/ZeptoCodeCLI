@@ -1532,20 +1532,12 @@ func (m *model) resetEntries() {
 	m.list.SetItems(nil)
 }
 
-// extraHeight is everything between the viewport and the statusline other
-// than the input itself: modal slot, activity lines, completion dropdown,
-// help view, and the input border (2 rows).
+// extraHeight is everything between the transcript and the statusline
+// other than the input itself: activity lines, completion dropdown, help
+// view, and the input border (2 rows). Dialogs float OVER the transcript
+// (see dialog.go) and cost no height.
 func (m *model) extraHeight() int {
 	h := 2 // input border
-	if m.question != nil {
-		h += lipgloss.Height(m.renderQuestion())
-	} else if m.mgmt != nil {
-		h += lipgloss.Height(m.renderMgmtForm())
-	} else if m.overlay != nil {
-		h += lipgloss.Height(m.overlay.render(m.width, 14))
-	} else if len(m.approvals) > 0 {
-		h += lipgloss.Height(m.renderModal())
-	}
 	if act := m.activityLines(); act != "" {
 		h += lipgloss.Height(act)
 	}
@@ -1556,26 +1548,6 @@ func (m *model) extraHeight() int {
 		h += lipgloss.Height(m.helpModel.FullHelpView(keys.FullHelp()))
 	}
 	return h
-}
-
-func (m *model) renderQuestion() string {
-	w := m.width - 4
-	if w < 20 {
-		w = 20
-	}
-	title := styleAccent.Render("agent asks") + styleInfo.Render("  (esc dismisses = deny)")
-	return styleModal.BorderForeground(theme.Accent).Width(w).
-		Render(title + "\n\n" + m.question.form.View(w-2))
-}
-
-func (m *model) renderMgmtForm() string {
-	w := m.width - 4
-	if w < 20 {
-		w = 20
-	}
-	title := styleAccent.Render(m.mgmt.title) + styleInfo.Render("  (esc cancels)")
-	return styleModal.BorderForeground(theme.Accent).Width(w).
-		Render(title + "\n\n" + m.mgmt.form.View(w-2))
 }
 
 func (m *model) layout() {
@@ -1764,13 +1736,10 @@ func (m *model) renderModal() string {
 		options += fmt.Sprintf("   [%d] %s", i+1, s.Text)
 	}
 
+	w := dialogWidth(m.width)
 	body := fmt.Sprintf("agent wants to run %s%s\n\n%s\n\n%s",
-		styleTool.Render(req.Request.ToolName), queued, detail, options)
-	w := m.width - 4
-	if w < 20 {
-		w = 20
-	}
-	return styleModal.Width(w).Render(body)
+		styleToolName.Render(req.Request.ToolName), queued, detail, styleInfo.Render(options))
+	return dialogBox("tool approval", "a/d or a number", body, w)
 }
 
 // verbStatus humanizes loop states.
@@ -1872,15 +1841,6 @@ func (m *model) viewContent() string {
 		return m.spin.View() + " connecting…"
 	}
 	parts := []string{m.list.View()}
-	if m.question != nil {
-		parts = append(parts, m.renderQuestion())
-	} else if m.mgmt != nil {
-		parts = append(parts, m.renderMgmtForm())
-	} else if m.overlay != nil {
-		parts = append(parts, m.overlay.render(m.width, 14))
-	} else if len(m.approvals) > 0 {
-		parts = append(parts, m.renderModal())
-	}
 	if act := m.activityLines(); act != "" {
 		parts = append(parts, act)
 	}
@@ -1899,7 +1859,13 @@ func (m *model) viewContent() string {
 		parts = append(parts, m.helpModel.FullHelpView(keys.FullHelp()))
 	}
 	parts = append(parts, m.statusline())
-	return strings.Join(parts, "\n")
+	base := strings.Join(parts, "\n")
+
+	// Dialogs float centered over everything (crush-style overlay).
+	if box := m.activeDialog(); box != "" {
+		return compositeDialog(base, box, m.width, m.height)
+	}
+	return base
 }
 
 // ── helpers ──

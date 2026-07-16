@@ -190,7 +190,7 @@ func applySecret(m *model, set map[string]string, unset []string, what string) t
 // openConfirmForm shows a yes/no confirm; onYes runs on confirmation.
 func openConfirmForm(m *model, title string, onYes func(m *model) tea.Cmd) tea.Cmd {
 	ok := false
-	mf := &mgmtForm{title: title}
+	mf := &mgmtForm{title: "confirm"}
 	mf.form = form.New(
 		form.NewConfirm(title).Affirmative("yes").Negative("no").Value(&ok),
 	)
