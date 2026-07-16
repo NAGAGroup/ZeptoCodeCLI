@@ -37,16 +37,16 @@ var keys = keymapT{
 	// Jobs is help-view-only: the panel opens via the /jobs client command
 	// (ctrl+j became newline; ctrl+g/ctrl+b clash with zellij/tmux). The f24
 	// dummy key exists because bubbles/help skips keyless bindings.
-	Jobs:          key.NewBinding(key.WithKeys("f24"), key.WithHelp("/jobs", "jobs/broker panel")),
-	Reasoning:     key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "toggle reasoning")),
-	ToolOutput:    key.NewBinding(key.WithKeys("ctrl+o"), key.WithHelp("ctrl+o", "toggle tool output")),
-	Mode:          key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "cycle permission mode")),
-	HistoryUp:     key.NewBinding(key.WithKeys("up"), key.WithHelp("↑/↓", "input history")),
-	HistoryDown:   key.NewBinding(key.WithKeys("down")),
-	ScrollUp:      key.NewBinding(key.WithKeys("pgup", "ctrl+u"), key.WithHelp("pgup/pgdn·wheel", "scroll")),
-	ScrollDown:    key.NewBinding(key.WithKeys("pgdown", "ctrl+d")),
-	Complete:      key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "complete / and @")),
-	Help:          key.NewBinding(key.WithKeys("ctrl+g"), key.WithHelp("ctrl+g", "help")),
+	Jobs:        key.NewBinding(key.WithKeys("f24"), key.WithHelp("/jobs", "jobs/broker panel")),
+	Reasoning:   key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "toggle reasoning")),
+	ToolOutput:  key.NewBinding(key.WithKeys("ctrl+o"), key.WithHelp("ctrl+o", "toggle tool output")),
+	Mode:        key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "cycle permission mode")),
+	HistoryUp:   key.NewBinding(key.WithKeys("up"), key.WithHelp("↑/↓", "input history")),
+	HistoryDown: key.NewBinding(key.WithKeys("down")),
+	ScrollUp:    key.NewBinding(key.WithKeys("pgup", "ctrl+u"), key.WithHelp("pgup/pgdn·wheel", "scroll")),
+	ScrollDown:  key.NewBinding(key.WithKeys("pgdown", "ctrl+d")),
+	Complete:    key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "complete / and @")),
+	Help:        key.NewBinding(key.WithKeys("ctrl+g"), key.WithHelp("ctrl+g", "help")),
 }
 
 // ShortHelp implements help.KeyMap (statusline hints).

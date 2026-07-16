@@ -463,6 +463,13 @@ func (c *Client) SwitchAgent(ctx context.Context, agent string) error {
 	return c.StartRuntime(ctx, agent)
 }
 
+// SwitchAgentConversation restarts the runtime on a specific agent AND
+// conversation (cross-agent jump, e.g. from /search results).
+func (c *Client) SwitchAgentConversation(ctx context.Context, agent, conversationID string) error {
+	c.opts.ConversationID = conversationID
+	return c.StartRuntime(ctx, agent)
+}
+
 // ackRequest sends a request and decodes the generic success/error envelope.
 func (c *Client) ackRequest(ctx context.Context, requestID string, v any) (*protocol.Ack, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -483,6 +490,94 @@ func (c *Client) ackRequest(ctx context.Context, requestID string, v any) (*prot
 		return nil, fmt.Errorf("%s failed: %s", f.Type, msg)
 	}
 	return &ack, nil
+}
+
+// jsonRequest sends a request and unmarshals the raw response into out,
+// which must embed Success/Error fields; returns an error on failure envelope.
+func (c *Client) jsonRequest(ctx context.Context, requestID string, cmd any, out any) error {
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(reqCtx, requestID, cmd)
+	if err != nil {
+		return err
+	}
+	var ack protocol.Ack
+	if err := json.Unmarshal(f.Raw, &ack); err != nil {
+		return err
+	}
+	if !ack.Success {
+		msg := ack.Error
+		if msg == "" {
+			msg = "unknown error"
+		}
+		return fmt.Errorf("%s failed: %s", f.Type, msg)
+	}
+	return json.Unmarshal(f.Raw, out)
+}
+
+// RecompileConversation recompiles the current agent+conversation and
+// returns the server's result string.
+func (c *Client) RecompileConversation(ctx context.Context) (string, error) {
+	cmd := protocol.ConversationRecompileCommand{
+		Type:           "conversation_recompile",
+		RequestID:      c.nextRequestID(),
+		ConversationID: c.Runtime.ConversationID,
+	}
+	var out struct {
+		Result string `json:"result"`
+	}
+	err := c.jsonRequest(ctx, cmd.RequestID, cmd, &out)
+	return out.Result, err
+}
+
+// Experiments fetches the local experiment snapshot.
+func (c *Client) Experiments(ctx context.Context) ([]protocol.ExperimentSnapshot, error) {
+	cmd := protocol.GetExperimentsCommand{Type: "get_experiments", RequestID: c.nextRequestID()}
+	var out struct {
+		Experiments []protocol.ExperimentSnapshot `json:"experiments"`
+	}
+	err := c.jsonRequest(ctx, cmd.RequestID, cmd, &out)
+	return out.Experiments, err
+}
+
+// SetExperiment toggles a local experiment override.
+func (c *Client) SetExperiment(ctx context.Context, id string, enabled bool) ([]protocol.ExperimentSnapshot, error) {
+	cmd := protocol.SetExperimentCommand{
+		Type: "set_experiment", RequestID: c.nextRequestID(),
+		ExperimentID: id, Enabled: &enabled,
+	}
+	var out struct {
+		Experiments []protocol.ExperimentSnapshot `json:"experiments"`
+	}
+	err := c.jsonRequest(ctx, cmd.RequestID, cmd, &out)
+	return out.Experiments, err
+}
+
+// ReflectionSettings fetches the agent's reflection (sleeptime) settings.
+func (c *Client) ReflectionSettings(ctx context.Context) (*protocol.ReflectionSettingsSnapshot, error) {
+	cmd := protocol.GetReflectionSettingsCommand{
+		Type: "get_reflection_settings", RequestID: c.nextRequestID(), Runtime: c.Runtime,
+	}
+	var out struct {
+		ReflectionSettings *protocol.ReflectionSettingsSnapshot `json:"reflection_settings"`
+	}
+	err := c.jsonRequest(ctx, cmd.RequestID, cmd, &out)
+	return out.ReflectionSettings, err
+}
+
+// SetReflectionSettings updates the agent's reflection trigger settings.
+func (c *Client) SetReflectionSettings(ctx context.Context, trigger string, stepCount int, scope string) (*protocol.ReflectionSettingsSnapshot, error) {
+	cmd := protocol.SetReflectionSettingsCommand{
+		Type: "set_reflection_settings", RequestID: c.nextRequestID(),
+		Runtime:  c.Runtime,
+		Settings: protocol.ReflectionSettingsBody{Trigger: trigger, StepCount: stepCount},
+		Scope:    scope,
+	}
+	var out struct {
+		ReflectionSettings *protocol.ReflectionSettingsSnapshot `json:"reflection_settings"`
+	}
+	err := c.jsonRequest(ctx, cmd.RequestID, cmd, &out)
+	return out.ReflectionSettings, err
 }
 
 // Fork forks the current conversation and returns the new conversation id.

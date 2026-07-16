@@ -46,9 +46,9 @@ func initTheme(isDark bool) {
 	// The charmtone palette (crush's), dark-first with legible light picks.
 	ld := lipgloss.LightDark(isDark)
 	theme = themeT{
-		User:   ld(charmtone.Ox, charmtone.Malibu),      // blue
-		Agent:  ld(charmtone.Guac, charmtone.Julep),     // green
-		Tool:   ld(charmtone.Mustard, charmtone.Zest),   // yellow
+		User:   ld(charmtone.Ox, charmtone.Malibu),    // blue
+		Agent:  ld(charmtone.Guac, charmtone.Julep),   // green
+		Tool:   ld(charmtone.Mustard, charmtone.Zest), // yellow
 		OK:     ld(charmtone.Guac, charmtone.Julep),
 		Danger: ld(charmtone.Sriracha, charmtone.Cherry),
 		Warn:   ld(charmtone.Cumin, charmtone.Citron),

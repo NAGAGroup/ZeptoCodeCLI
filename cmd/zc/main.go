@@ -133,33 +133,37 @@ type model struct {
 	seenApprovals map[string]bool // control_request request_ids already queued
 
 	// milestone 3+ state
-	overlay        *overlay
-	completion     completionState
-	question       *questionForm // AskUserQuestion takes over the modal slot
-	mgmt           *mgmtForm     // management-command forms share that slot
-	memoryDir      string        // agent MemFS root (from device_status)
-	helpModel      help.Model
-	showHelp       bool
-	spin           spinner.Model
-	showReasoning  bool // reasoning collapsed by default
-	showToolOutput bool // tool-return previews hidden by default
-	queue          []protocol.QueueItem
-	subagents      []protocol.SubagentSnapshot
-	supportedCmds  []string
-	modCmds        []protocol.ModCommandInfo
-	serverVersion  string
-	versionWarned  bool
-	serverCWD      string
-	modelHandle    string // current model handle (agent_retrieve / /model)
-	agentName      string // display name for the statusline
-	convTitle      string // conversation title for the statusline
-	pager          *pager // modal scrollable viewer (diffs, memory files)
-	lastUsage      protocol.Delta
-	sessionTokens  int64
-	ctrlCArmed     time.Time
-	reconnectTried bool
-	spinning       bool
-	switching      bool // conversation/agent switch in flight (history loading)
+	overlay            *overlay
+	completion         completionState
+	question           *questionForm // AskUserQuestion takes over the modal slot
+	mgmt               *mgmtForm     // management-command forms share that slot
+	memoryDir          string        // agent MemFS root (from device_status)
+	helpModel          help.Model
+	showHelp           bool
+	spin               spinner.Model
+	showReasoning      bool // reasoning collapsed by default
+	showToolOutput     bool // tool-return previews hidden by default
+	queue              []protocol.QueueItem
+	subagents          []protocol.SubagentSnapshot
+	supportedCmds      []string
+	modCmds            []protocol.ModCommandInfo
+	serverVersion      string
+	versionWarned      bool
+	serverCWD          string
+	modelHandle        string // current model handle (agent_retrieve / /model)
+	agentName          string // display name for the statusline
+	convTitle          string // conversation title for the statusline
+	pager              *pager // modal scrollable viewer (diffs, memory files)
+	lastUsage          protocol.Delta
+	sessionTokens      int64
+	ctrlCArmed         time.Time
+	reconnectTried     bool
+	spinning           bool
+	switching          bool // conversation/agent switch in flight (history loading)
+	bgProcs            []protocol.BackgroundProcessSummary
+	modelID            string // current model catalog id when known (variant cycling)
+	reasoningTabCycle  bool   // Tab on empty input cycles reasoning variants
+	statuslineTemplate string // custom statusline template (~/.letta/zc.json)
 
 	// startup state machine (phase 4): the TUI owns connection + agent pick
 	phase      int // phaseConnecting | phasePicking | phaseChat
@@ -195,7 +199,7 @@ func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) 
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
 	sp.Style = lipgloss.NewStyle().Foreground(theme.Accent)
-	return &model{
+	mm := &model{
 		cli:           cli,
 		logPath:       logPath,
 		port:          port,
@@ -209,7 +213,30 @@ func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) 
 		mode:          "?", // real mode arrives via update_device_status
 		connected:     true,
 		seenApprovals: map[string]bool{},
+
+		reasoningTabCycle: readReasoningTabSetting(),
 	}
+	if tpl, ok := readZcConfig()["statusline"].(string); ok {
+		mm.statuslineTemplate = tpl
+	}
+	return mm
+}
+
+// readReasoningTabSetting reads reasoningTabCycleEnabled from settings.json.
+func readReasoningTabSetting() bool {
+	path, err := globalSettingsPath()
+	if err != nil {
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var s struct {
+		ReasoningTabCycleEnabled bool `json:"reasoningTabCycleEnabled"`
+	}
+	_ = json.Unmarshal(raw, &s)
+	return s.ReasoningTabCycleEnabled
 }
 
 // ── list adapter: entries as lazily rendered list items ──
@@ -293,11 +320,7 @@ func (m *model) connectCmd() tea.Cmd {
 				cli.Close()
 				return connectDoneMsg{err: err}
 			}
-			items := make([]overlayItem, 0, len(agents))
-			for _, a := range agents {
-				items = append(items, overlayItem{id: a.ID, title: a.Name, desc: a.ID})
-			}
-			return connectDoneMsg{cli: cli, agents: items}
+			return connectDoneMsg{cli: cli, agents: agentOverlayItems(agents)}
 		}
 		return connectDoneMsg{cli: cli}
 	}
@@ -519,6 +542,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendEntry(&entry{kind: entryError, text: "model switch failed: " + msg.err.Error()})
 		} else {
 			m.modelHandle = msg.resp.ModelHandle
+			m.modelID = msg.resp.ModelID
 			m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf(
 				"model → %s (%s, applied to %s)", msg.resp.ModelID, msg.resp.ModelHandle, msg.resp.AppliedTo)})
 		}
@@ -866,6 +890,11 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.String() == "tab" {
+			// Native parity: with /reasoning-tab on, Tab on an empty input
+			// cycles the current model's reasoning variants.
+			if m.reasoningTabCycle && strings.TrimSpace(m.input.Value()) == "" {
+				return m, m.cycleReasoningVariant()
+			}
 			return m, nil // swallow raw tabs; textarea tabs are never wanted
 		}
 	case "enter":
@@ -1036,6 +1065,37 @@ func (m *model) switchModel(payload protocol.UpdateModelPayload) tea.Cmd {
 	}
 }
 
+// cycleReasoningVariant switches to the next catalog id sharing the current
+// model handle (reasoning-effort variants share handle+label, differ by id).
+func (m *model) cycleReasoningVariant() tea.Cmd {
+	cli := m.cli
+	curHandle, curID := m.modelHandle, m.modelID
+	return func() tea.Msg {
+		resp, err := cli.ListModels(context.Background(), false)
+		if err != nil {
+			return modelSwitchedMsg{err: err}
+		}
+		var group []string
+		for _, e := range resp.Entries {
+			if e.Handle != "" && e.Handle == curHandle {
+				group = append(group, e.ID)
+			}
+		}
+		if len(group) < 2 {
+			return modelSwitchedMsg{err: fmt.Errorf("no reasoning variants for %s", curHandle)}
+		}
+		next := group[0]
+		for i, id := range group {
+			if id == curID {
+				next = group[(i+1)%len(group)]
+				break
+			}
+		}
+		out, err := cli.UpdateModel(context.Background(), protocol.UpdateModelPayload{ModelID: next})
+		return modelSwitchedMsg{resp: out, err: err}
+	}
+}
+
 func (m *model) openAgentPicker() tea.Cmd {
 	cli := m.cli
 	return func() tea.Msg {
@@ -1043,12 +1103,25 @@ func (m *model) openAgentPicker() tea.Cmd {
 		if err != nil {
 			return agentsMsg{err: err}
 		}
-		items := make([]overlayItem, 0, len(agents))
-		for _, a := range agents {
-			items = append(items, overlayItem{id: a.ID, title: a.Name, desc: a.ID})
-		}
-		return agentsMsg{items: items}
+		return agentsMsg{items: agentOverlayItems(agents)}
 	}
+}
+
+// agentOverlayItems builds picker rows with pinned agents (settings.json
+// agents[].pinned) floated to the top and starred.
+func agentOverlayItems(agents []protocol.AgentSummary) []overlayItem {
+	pinned := pinnedAgentIDs()
+	var top, rest []overlayItem
+	for _, a := range agents {
+		it := overlayItem{id: a.ID, title: a.Name, desc: a.ID}
+		if pinned[a.ID] {
+			it.title = "★ " + it.title
+			top = append(top, it)
+		} else {
+			rest = append(rest, it)
+		}
+	}
+	return append(top, rest...)
 }
 
 // switchAgent restarts the runtime on another agent (fresh conversation),
@@ -1261,13 +1334,42 @@ var clientCommands = []clientCommand{
 	{"skills", "list/enable/disable skills: /skills [list] | enable <path> | disable <name>", cmdSkills},
 	{"connect", "connect model providers: /connect [usage]", cmdConnect},
 	{"memory", "browse agent memory: /memory [list] | view|write|rm <path> | enable", cmdMemory},
-	{"memory-repository", "memory commit history: /memory-repository [file]", cmdMemoryRepository},
+	{"memory-repository", "memory repo: /memory-repository [file] | set <url> | unset | status | push", cmdMemoryRepository},
 	{"mods", "list mods, /mods reload applies changes", cmdMods},
 	{"hooks", "show configured hooks from all settings files", cmdHooks},
 	{"mcp", "MCP status (not wireable on local backend)", cmdMCP},
 	{"profiles", "agent profiles: /profiles [list] | save <name> | rm <name>", cmdProfiles},
 	{"crons", "cron tasks: /crons [list] | trigger <ref> | rm <ref>", cmdCrons},
 	{"tidy", "archive empty conversations across all agents", cmdTidy},
+	{"description", "set agent description: /description <text>", cmdDescription},
+	{"recompile", "recompile the current agent + conversation", cmdRecompile},
+	{"context", "show context window usage", cmdContext},
+	{"bg", "show background processes", cmdBg},
+	{"search", "search messages across agents: /search <query>", cmdSearch},
+	{"pin", "pin the current agent (picker priority)", cmdPinWith(true)},
+	{"unpin", "unpin the current agent", cmdPinWith(false)},
+	{"reasoning-tab", "Tab on empty input cycles reasoning variants: /reasoning-tab on|off", cmdReasoningTab},
+	{"memfs", "memory filesystem: /memfs [status|enable|disable]", cmdMemfs},
+	{"compaction", "compaction mode: /compaction [all|sliding_window]", cmdCompaction},
+	{"experiments", "local experiments: /experiments [<id> on|off]", cmdExperiments},
+	{"sleeptime", "reflection trigger: /sleeptime [off|step-count [N]|compaction-event]", cmdSleeptime},
+	{"system", "switch system prompt preset: /system [preset]", cmdSystem},
+	{"personality", "switch personality preset (replaces persona+human memory)", cmdPersonality},
+	{"reflect", "run a reflection pass: /reflect [--conversation <id>] [instruction]", cmdReflect},
+	{"statusline", "customize the statusline: /statusline [template|reset]", cmdStatusline},
+	{"feedback", "send feedback to the Letta team: /feedback [message]", cmdFeedback},
+	{"skill-creator", "guided skill creation: /skill-creator [description]", func(m *model, args string) tea.Cmd {
+		msg := "Load and follow your \"creating-skills\" skill to guide me through creating a new skill."
+		if strings.TrimSpace(args) != "" {
+			msg += " The skill should: " + strings.TrimSpace(args)
+		}
+		m.closeStreaming()
+		m.appendEntry(&entry{kind: entryUser, text: "/skill-creator " + args})
+		if err := m.cli.SendUserMessage(msg); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "send failed: " + err.Error()})
+		}
+		return nil
+	}},
 	{"help", "toggle keybinding help", func(m *model, _ string) tea.Cmd {
 		m.showHelp = !m.showHelp
 		m.layout()
@@ -1333,7 +1435,16 @@ func (m *model) knownCommands() []overlayItem {
 		if seen[c] {
 			continue
 		}
+		seen[c] = true
 		items = append(items, overlayItem{id: c, title: "/" + c, desc: "built-in"})
+	}
+	// Skills are invocable directly: /<skill-name> [instructions].
+	for _, sk := range scanSkills(m.memoryDir, m.serverCWD) {
+		if seen[sk.name] {
+			continue
+		}
+		seen[sk.name] = true
+		items = append(items, overlayItem{id: sk.name, title: "/" + sk.name, desc: "skill · " + compactOneLine(sk.desc, 80)})
 	}
 	return items
 }
@@ -1487,6 +1598,23 @@ func (m *model) dispatchSlashCommand(text string) tea.Cmd {
 		}
 	}
 	if !known {
+		// Direct skill invocation (native parity): /<skill-name> [args]
+		// sends a real message asking the agent to load that skill.
+		for _, sk := range scanSkills(m.memoryDir, m.serverCWD) {
+			if sk.name == name {
+				msg := fmt.Sprintf("Load and follow your %q skill", name)
+				if args != "" {
+					msg += ", then: " + args
+				}
+				m.closeStreaming()
+				m.appendEntry(&entry{kind: entryUser, text: "/" + name + " " + args})
+				if err := m.cli.SendUserMessage(msg); err != nil {
+					m.appendEntry(&entry{kind: entryError, text: "send failed: " + err.Error()})
+				}
+				m.refreshViewport()
+				return nil
+			}
+		}
 		m.appendEntry(&entry{kind: entryError, text: "unknown command: /" + name + " (ctrl+k lists commands)"})
 		m.refreshViewport()
 		return nil
@@ -1543,6 +1671,7 @@ func (m *model) handleFrame(f protocol.Frame) {
 		if ds.MemoryDirectory != "" {
 			m.memoryDir = ds.MemoryDirectory
 		}
+		m.bgProcs = ds.BackgroundProcesses
 		if ds.LettaCodeVersion != "" {
 			m.serverVersion = ds.LettaCodeVersion
 			if !m.versionWarned && !strings.HasPrefix(ds.LettaCodeVersion, testedLettaCode) {
@@ -2003,15 +2132,38 @@ func (m *model) statusline() string {
 		conv = m.cli.Runtime.ConversationID
 	}
 	conv = compactOneLine(conv, 32)
+	queue := ""
+	if n := len(m.queue); n > 0 {
+		queue = styleAccent.Render(fmt.Sprintf("%s%d", iconQueue, n))
+	}
+	hints := styleInfo.Render("^k cmds · ^p convs · ^j newline · ^g help ")
+
+	// Custom template (/statusline): substitute placeholders and render flat.
+	if m.statuslineTemplate != "" {
+		line := m.statuslineTemplate
+		for k, v := range map[string]string{
+			"{mode}":         pill,
+			"{agent}":        agent,
+			"{conversation}": conv,
+			"{model}":        shortModel(m.modelHandle),
+			"{status}":       status,
+			"{queue}":        queue,
+			"{hints}":        hints,
+		} {
+			line = strings.ReplaceAll(line, k, v)
+		}
+		return line
+	}
+
 	left := pill + styleInfo.Render(fmt.Sprintf(" %s · %s ", agent, conv))
 	if model := shortModel(m.modelHandle); model != "" {
 		left += styleAccent.Render("◇ "+model) + " "
 	}
 	left += status
-	if n := len(m.queue); n > 0 {
-		left += styleAccent.Render(fmt.Sprintf(" · %s%d", iconQueue, n))
+	if queue != "" {
+		left += " · " + queue
 	}
-	right := styleInfo.Render("^k cmds · ^p convs · ^j newline · ^g help ")
+	right := hints
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		return left
@@ -2057,6 +2209,18 @@ func (m *model) View() tea.View {
 	v := tea.NewView(m.viewContent())
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
+	// Terminal window/tab title (native sets this via /title; zc keeps it
+	// automatic: who am I talking to, in which conversation).
+	title := "zc"
+	if m.agentName != "" {
+		title += " — " + m.agentName
+		if conv := m.convTitle; conv != "" {
+			title += " · " + compactOneLine(conv, 40)
+		} else if m.cli != nil && m.cli.Runtime.ConversationID != "" {
+			title += " · " + m.cli.Runtime.ConversationID
+		}
+	}
+	v.WindowTitle = title
 	return v
 }
 
@@ -2154,7 +2318,6 @@ func truncateLines(s string, maxLines, maxChars int) string {
 	}
 	return strings.Join(lines, "\n")
 }
-
 
 // ── main ──
 

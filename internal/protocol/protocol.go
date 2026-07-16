@@ -181,6 +181,75 @@ type ConversationUpdateCommand struct {
 	Body           map[string]any `json:"body"`
 }
 
+type ConversationRecompileCommand struct {
+	Type           string `json:"type"` // "conversation_recompile"
+	RequestID      string `json:"request_id"`
+	ConversationID string `json:"conversation_id"`
+}
+
+// GetExperimentsCommand / SetExperimentCommand toggle local experiments.
+type GetExperimentsCommand struct {
+	Type      string `json:"type"` // "get_experiments"
+	RequestID string `json:"request_id"`
+}
+
+type SetExperimentCommand struct {
+	Type         string `json:"type"` // "set_experiment"
+	RequestID    string `json:"request_id"`
+	ExperimentID string `json:"experiment_id"`
+	Enabled      *bool  `json:"enabled"` // null clears the override
+}
+
+type ExperimentSnapshot struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	EnvVar      string `json:"envVar"`
+	Enabled     bool   `json:"enabled"`
+	Source      string `json:"source"`
+}
+
+// Reflection (sleeptime) settings: trigger off|step-count|compaction-event.
+// Both commands are runtime-scoped (validated server-side — an agent_id
+// field alone fails validation and the request is silently dropped).
+type GetReflectionSettingsCommand struct {
+	Type      string       `json:"type"` // "get_reflection_settings"
+	RequestID string       `json:"request_id"`
+	Runtime   RuntimeScope `json:"runtime"`
+}
+
+type ReflectionSettingsBody struct {
+	Trigger   string `json:"trigger"`
+	StepCount int    `json:"step_count"`
+}
+
+type SetReflectionSettingsCommand struct {
+	Type      string                 `json:"type"` // "set_reflection_settings"
+	RequestID string                 `json:"request_id"`
+	Runtime   RuntimeScope           `json:"runtime"`
+	Settings  ReflectionSettingsBody `json:"settings"`
+	Scope     string                 `json:"scope,omitempty"` // local_project|global|both
+}
+
+type ReflectionSettingsSnapshot struct {
+	AgentID   string `json:"agent_id"`
+	Trigger   string `json:"trigger"`
+	StepCount int    `json:"step_count"`
+}
+
+// BackgroundProcessSummary is a union: kind "bash" (command/exit_code) or
+// "agent_task" (task_type/description). Delivered inside device_status.
+type BackgroundProcessSummary struct {
+	ProcessID   string `json:"process_id"`
+	Kind        string `json:"kind"`
+	Command     string `json:"command"`
+	TaskType    string `json:"task_type"`
+	Description string `json:"description"`
+	StartedAtMs int64  `json:"started_at_ms"`
+	Status      string `json:"status"`
+	ExitCode    *int   `json:"exit_code"`
+}
+
 type AgentUpdateCommand struct {
 	Type      string         `json:"type"` // "agent_update"
 	RequestID string         `json:"request_id"`
@@ -271,6 +340,12 @@ type ConversationSummary struct {
 	UpdatedAt     string `json:"updated_at"`
 	LastMessageAt string `json:"last_message_at"`
 	Archived      bool   `json:"archived"`
+	// Context accounting (local backend): ids currently in context plus the
+	// per-conversation window limit override when set.
+	InContextMessageIDs []string `json:"in_context_message_ids"`
+	ModelSettings       struct {
+		ContextWindowLimit int64 `json:"context_window_limit"`
+	} `json:"model_settings"`
 }
 
 type ConversationListResponse struct {
@@ -473,7 +548,9 @@ type DeviceStatusUpdate struct {
 		PendingControlRequests []PendingControlRequestSnapshot `json:"pending_control_requests"`
 		// MemoryDirectory is the agent's MemFS root on this machine (null
 		// until memfs is enabled). Used by /skills to find agent skills.
-		MemoryDirectory string `json:"memory_directory"`
+		MemoryDirectory     string                     `json:"memory_directory"`
+		BackgroundProcesses []BackgroundProcessSummary `json:"background_processes"`
+		Experiments         []ExperimentSnapshot       `json:"experiments"`
 	} `json:"device_status"`
 }
 

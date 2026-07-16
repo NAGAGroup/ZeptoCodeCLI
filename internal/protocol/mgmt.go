@@ -133,10 +133,10 @@ type ConnectProviderEntry struct {
 }
 
 type ConnectProvidersResponse struct {
-	Success               bool                   `json:"success"`
-	Providers             []ConnectProviderEntry `json:"providers"`
-	ModelsMayHaveChanged  bool                   `json:"models_may_have_changed"`
-	Error                 string                 `json:"error"`
+	Success              bool                   `json:"success"`
+	Providers            []ConnectProviderEntry `json:"providers"`
+	ModelsMayHaveChanged bool                   `json:"models_may_have_changed"`
+	Error                string                 `json:"error"`
 }
 
 type ChatGPTUsageReadCommand struct {

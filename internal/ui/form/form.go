@@ -184,10 +184,10 @@ type Select struct {
 
 func NewSelect(title string) *Select { return &Select{base: base{title: title}} }
 
-func (s *Select) Description(d string) *Select        { s.desc = d; return s }
-func (s *Select) Options(opts ...Option) *Select      { s.options = opts; return s }
-func (s *Select) Value(v *string) *Select             { s.value = v; return s }
-func (s *Select) WithHide(fn func() bool) *Select     { s.hideFunc = fn; return s }
+func (s *Select) Description(d string) *Select    { s.desc = d; return s }
+func (s *Select) Options(opts ...Option) *Select  { s.options = opts; return s }
+func (s *Select) Value(v *string) *Select         { s.value = v; return s }
+func (s *Select) WithHide(fn func() bool) *Select { s.hideFunc = fn; return s }
 
 func (s *Select) Focus() tea.Cmd {
 	// Restore cursor from the bound value when revisiting.

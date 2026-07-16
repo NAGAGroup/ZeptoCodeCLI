@@ -9,12 +9,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -727,6 +732,13 @@ func cmdMemory(m *model, args string) tea.Cmd {
 // ── /memory-repository ──
 
 func cmdMemoryRepository(m *model, args string) tea.Cmd {
+	fields := strings.Fields(args)
+	if len(fields) > 0 {
+		switch fields[0] {
+		case "set", "unset", "status", "push":
+			return cmdMemoryRepositoryRemote(m, fields)
+		}
+	}
 	filePath := strings.TrimSpace(args)
 	cli := m.cli
 	return func() tea.Msg {
@@ -1319,5 +1331,1058 @@ func cmdTidy(m *model, _ string) tea.Cmd {
 			}
 		}
 		return mgmtMsg{form: mf}
+	}
+}
+
+// ── /description ──
+
+func cmdDescription(m *model, args string) tea.Cmd {
+	text := strings.TrimSpace(args)
+	if text == "" {
+		return func() tea.Msg { return mgmtMsg{err: fmt.Errorf("usage: /description <text>")} }
+	}
+	cli := m.cli
+	return func() tea.Msg {
+		if err := cli.UpdateAgent(context.Background(), map[string]any{"description": text}); err != nil {
+			return mgmtMsg{err: err, errWrap: "/description"}
+		}
+		return mgmtMsg{infoTxt: "agent description updated"}
+	}
+}
+
+// ── /recompile ──
+
+func cmdRecompile(m *model, _ string) tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		result, err := cli.RecompileConversation(context.Background())
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/recompile"}
+		}
+		if result == "" {
+			result = "recompiled"
+		}
+		return mgmtMsg{infoTxt: "recompile: " + compactOneLine(result, 200)}
+	}
+}
+
+// ── /context ──
+//
+// The local backend reports usage sparsely (prompt tokens only on real
+// steps), so this view is honest about what it knows: last-step prompt
+// tokens ≈ context size, in-context message count, and the window limit.
+
+func cmdContext(m *model, _ string) tea.Cmd {
+	cli := m.cli
+	prompt := m.lastUsage.PromptTokens
+	return func() tea.Msg {
+		convs, err := cli.ConversationsList(context.Background())
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/context"}
+		}
+		var inCtx int
+		var limit int64
+		for _, c := range convs {
+			if c.ID == cli.Runtime.ConversationID {
+				inCtx = len(c.InContextMessageIDs)
+				limit = c.ModelSettings.ContextWindowLimit
+				break
+			}
+		}
+		rows := [][2]string{
+			{"in-context messages", fmt.Sprintf("%d", inCtx)},
+		}
+		if prompt > 0 {
+			row := fmt.Sprintf("%d tokens (last step)", prompt)
+			if limit > 0 {
+				row += fmt.Sprintf(" · %.0f%% of %d", float64(prompt)/float64(limit)*100, limit)
+			}
+			rows = append(rows, [2]string{"context used", row})
+		} else if limit > 0 {
+			rows = append(rows, [2]string{"context limit", fmt.Sprintf("%d tokens", limit)})
+		} else {
+			rows = append(rows, [2]string{"context used", "(no usage reported yet this session)"})
+		}
+		return mgmtMsg{entry: &entry{kind: entryCommand, cmdInput: "/context", text: kvBlock(rows)}}
+	}
+}
+
+// ── /bg ──
+//
+// background_processes arrives on every device_status update; this just
+// renders the latest snapshot (bash background tasks + agent tasks).
+
+func cmdBg(m *model, _ string) tea.Cmd {
+	if len(m.bgProcs) == 0 {
+		m.appendEntry(&entry{kind: entryInfo, text: "no background processes"})
+		return nil
+	}
+	var rows [][2]string
+	for _, p := range m.bgProcs {
+		what := p.Command
+		if p.Kind == "agent_task" {
+			what = p.TaskType + ": " + p.Description
+		}
+		status := p.Status
+		if p.ExitCode != nil {
+			status += fmt.Sprintf(" (exit %d)", *p.ExitCode)
+		}
+		rows = append(rows, [2]string{p.ProcessID, status + "  " + compactOneLine(what, 80)})
+	}
+	m.appendEntry(&entry{kind: entryCommand, cmdInput: "/bg", text: kvBlock(rows)})
+	return nil
+}
+
+// ── /search ──
+//
+// Cross-agent message search. The wire has no search command (native calls
+// it in-process), but zc runs on the same box as the local backend, so it
+// scans ~/.letta/lc-local-backend/conversations/*/messages.jsonl directly.
+// Dir names are unpadded base64 of "conversation:<id>" (default:<agent-id>
+// dirs — primary histories — are skipped: they are not resumable by id).
+
+type searchHit struct {
+	agentID, convID, snippet, when string
+}
+
+func cmdSearch(m *model, args string) tea.Cmd {
+	query := strings.TrimSpace(args)
+	if query == "" {
+		return func() tea.Msg { return mgmtMsg{err: fmt.Errorf("usage: /search <query>")} }
+	}
+	cli := m.cli
+	currentAgent := cli.Runtime.AgentID
+	return func() tea.Msg {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/search"}
+		}
+		root := filepath.Join(home, ".letta", "lc-local-backend", "conversations")
+		dirs, err := os.ReadDir(root)
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/search"}
+		}
+		agentNames := map[string]string{}
+		if agents, err := cli.ListAgents(context.Background()); err == nil {
+			for _, a := range agents {
+				agentNames[a.ID] = a.Name
+			}
+		}
+		const maxHits = 100
+		var hits []searchHit
+		lower := strings.ToLower(query)
+		for _, d := range dirs {
+			if !d.IsDir() {
+				continue
+			}
+			raw, err := base64.RawStdEncoding.DecodeString(d.Name())
+			if err != nil || !strings.HasPrefix(string(raw), "conversation:") {
+				continue
+			}
+			convID := strings.TrimPrefix(string(raw), "conversation:")
+			f, err := os.Open(filepath.Join(root, d.Name(), "messages.jsonl"))
+			if err != nil {
+				continue // no messages yet
+			}
+			sc := bufio.NewScanner(f)
+			sc.Buffer(make([]byte, 0, 1024*1024), 32*1024*1024) // thinking blocks are huge
+			perConv := 0
+			for sc.Scan() && perConv < 3 && len(hits) < maxHits {
+				line := sc.Bytes()
+				if !bytes.Contains(bytes.ToLower(line), []byte(lower)) {
+					continue // cheap pre-filter before JSON decode
+				}
+				var rec struct {
+					Type    string `json:"type"`
+					Message struct {
+						Role     string `json:"role"`
+						Metadata struct {
+							AgentID   string `json:"agent_id"`
+							CreatedAt string `json:"created_at"`
+						} `json:"metadata"`
+						Content json.RawMessage `json:"content"`
+					} `json:"message"`
+				}
+				if json.Unmarshal(line, &rec) != nil || rec.Type != "message" {
+					continue
+				}
+				if rec.Message.Role != "user" && rec.Message.Role != "assistant" {
+					continue
+				}
+				text := extractTextBlocks(rec.Message.Content)
+				idx := strings.Index(strings.ToLower(text), lower)
+				if idx < 0 {
+					continue // matched only in thinking/tool noise
+				}
+				start := idx - 40
+				if start < 0 {
+					start = 0
+				}
+				end := idx + len(query) + 60
+				if end > len(text) {
+					end = len(text)
+				}
+				hits = append(hits, searchHit{
+					agentID: rec.Message.Metadata.AgentID,
+					convID:  convID,
+					snippet: rec.Message.Role + ": …" + compactOneLine(text[start:end], 90) + "…",
+					when:    rec.Message.Metadata.CreatedAt,
+				})
+				perConv++
+			}
+			f.Close()
+			if len(hits) >= maxHits {
+				break
+			}
+		}
+		if len(hits) == 0 {
+			return mgmtMsg{infoTxt: fmt.Sprintf("search: no matches for %q", query)}
+		}
+		items := make([]overlayItem, 0, len(hits))
+		for _, h := range hits {
+			name := agentNames[h.agentID]
+			if name == "" {
+				name = shortID(h.agentID)
+			}
+			items = append(items, overlayItem{
+				id:    h.agentID + "|" + h.convID,
+				title: name + " · " + h.convID,
+				desc:  h.snippet + "  " + h.when,
+			})
+		}
+		ov := &overlay{kind: overlayMgmt, title: fmt.Sprintf("search: %q (%d hits — enter jumps)", query, len(hits)), items: items}
+		ov.onSelect = func(m *model, it overlayItem) tea.Cmd {
+			parts := strings.SplitN(it.id, "|", 2)
+			if len(parts) != 2 {
+				return nil
+			}
+			agentID, convID := parts[0], parts[1]
+			cli := m.cli
+			if agentID == currentAgent || agentID == "" {
+				return m.beginSwitch(m.switchConversation(convID))
+			}
+			return m.beginSwitch(func() tea.Msg {
+				if err := cli.SwitchAgentConversation(context.Background(), agentID, convID); err != nil {
+					return switchedMsg{err: err}
+				}
+				hist, histErr := cli.MessagesList(context.Background())
+				return switchedMsg{conversationID: cli.Runtime.ConversationID, history: hist, resumed: true, histErr: histErr}
+			})
+		}
+		return mgmtMsg{overlay: ov}
+	}
+}
+
+// extractTextBlocks pulls user/assistant-visible text out of a message
+// content payload (string or array of typed blocks; thinking is skipped).
+func extractTextBlocks(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, bl := range blocks {
+		if bl.Type == "text" && bl.Text != "" {
+			b.WriteString(bl.Text)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// ── settings-file helpers (pin/memfs/reasoning-tab) ──
+//
+// The app-server caches settings in memory and re-persists its cached
+// object on its own writes, resurrecting externally-deleted keys. Every
+// zc-side settings write MUST be followed by a remote reload (same rule
+// as /profiles).
+
+// mutateGlobalSettings read-modify-writes ~/.letta/settings.json.
+func mutateGlobalSettings(mutate func(s map[string]any) error) error {
+	path, err := globalSettingsPath()
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var s map[string]any
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return err
+	}
+	if err := mutate(s); err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(out, '\n'), 0o600)
+}
+
+// setAgentSettingsFlag sets a boolean on the current agent's entries in the
+// settings.json agents[] array (pinned, memfs, ...). An agent can have
+// MULTIPLE entries whose baseUrl are path aliases of the same backend (e.g.
+// Silverblue's /home symlink vs /var/home realpath) — update all of them.
+func setAgentSettingsFlag(agentID, key string, val bool) error {
+	return mutateAgentSettingsEntries(agentID, func(entry map[string]any) {
+		entry[key] = val
+	})
+}
+
+// mutateAgentSettingsEntries applies fn to every agents[] entry for agentID.
+func mutateAgentSettingsEntries(agentID string, fn func(entry map[string]any)) error {
+	return mutateGlobalSettings(func(s map[string]any) error {
+		agents, _ := s["agents"].([]any)
+		hit := false
+		for _, a := range agents {
+			entry, ok := a.(map[string]any)
+			if !ok {
+				continue
+			}
+			if id, _ := entry["agentId"].(string); id == agentID {
+				fn(entry)
+				hit = true
+			}
+		}
+		if !hit {
+			return fmt.Errorf("agent %s has no settings entry (open it in native letta once)", agentID)
+		}
+		return nil
+	})
+}
+
+// pinnedAgentIDs reads the pinned agent set from settings.json.
+func pinnedAgentIDs() map[string]bool {
+	out := map[string]bool{}
+	path, err := globalSettingsPath()
+	if err != nil {
+		return out
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	var s struct {
+		Agents []struct {
+			AgentID string `json:"agentId"`
+			Pinned  bool   `json:"pinned"`
+		} `json:"agents"`
+	}
+	if json.Unmarshal(raw, &s) != nil {
+		return out
+	}
+	for _, a := range s.Agents {
+		if a.Pinned {
+			out[a.AgentID] = true
+		}
+	}
+	return out
+}
+
+func cmdPinWith(pin bool) func(m *model, args string) tea.Cmd {
+	return func(m *model, args string) tea.Cmd {
+		if strings.Contains(args, "-l") {
+			return func() tea.Msg {
+				return mgmtMsg{err: fmt.Errorf("project-local pins are not supported in zc yet — global only")}
+			}
+		}
+		cli := m.cli
+		agentID := cli.Runtime.AgentID
+		name := m.agentName
+		return func() tea.Msg {
+			if err := setAgentSettingsFlag(agentID, "pinned", pin); err != nil {
+				return mgmtMsg{err: err, errWrap: "/pin"}
+			}
+			_ = cli.ExecuteCommand("reload", "") // settings-cache race: see helper doc
+			verb := "pinned"
+			if !pin {
+				verb = "unpinned"
+			}
+			return mgmtMsg{infoTxt: fmt.Sprintf("%s %s", verb, name)}
+		}
+	}
+}
+
+// ── /reasoning-tab ──
+
+func cmdReasoningTab(m *model, args string) tea.Cmd {
+	arg := strings.TrimSpace(args)
+	switch arg {
+	case "on", "off":
+		cli := m.cli
+		enabled := arg == "on"
+		m.reasoningTabCycle = enabled
+		return func() tea.Msg {
+			err := mutateGlobalSettings(func(s map[string]any) error {
+				s["reasoningTabCycleEnabled"] = enabled
+				return nil
+			})
+			if err != nil {
+				return mgmtMsg{err: err, errWrap: "/reasoning-tab"}
+			}
+			_ = cli.ExecuteCommand("reload", "")
+			return mgmtMsg{infoTxt: "reasoning-tab " + arg + " — Tab on an empty input cycles reasoning variants"}
+		}
+	default:
+		state := "off"
+		if m.reasoningTabCycle {
+			state = "on"
+		}
+		m.appendEntry(&entry{kind: entryInfo, text: "reasoning-tab is " + state + " (usage: /reasoning-tab on|off)"})
+		return nil
+	}
+}
+
+// ── /memfs ──
+
+func cmdMemfs(m *model, args string) tea.Cmd {
+	arg := strings.TrimSpace(args)
+	cli := m.cli
+	agentID := cli.Runtime.AgentID
+	switch arg {
+	case "", "status":
+		dir := m.memoryDir
+		if dir == "" {
+			dir = "(disabled — no memory directory)"
+		}
+		m.appendEntry(&entry{kind: entryCommand, cmdInput: "/memfs", text: kvBlock([][2]string{
+			{"memory directory", dir},
+		})})
+		return nil
+	case "enable", "disable":
+		return func() tea.Msg {
+			if err := setAgentSettingsFlag(agentID, "memfs", arg == "enable"); err != nil {
+				return mgmtMsg{err: err, errWrap: "/memfs"}
+			}
+			_ = cli.ExecuteCommand("reload", "")
+			return mgmtMsg{infoTxt: "memfs " + arg + "d — takes effect on the next runtime start (/new or restart)"}
+		}
+	default:
+		return func() tea.Msg {
+			return mgmtMsg{err: fmt.Errorf("usage: /memfs [status|enable|disable] (sync/reset are harness-internal — use native letta)")}
+		}
+	}
+}
+
+// ── /compaction ──
+
+func cmdCompaction(m *model, args string) tea.Cmd {
+	mode := strings.TrimSpace(args)
+	cli := m.cli
+	if mode == "" {
+		return func() tea.Msg {
+			agent, err := cli.AgentRetrieveRaw(context.Background())
+			if err != nil {
+				return mgmtMsg{err: err, errWrap: "/compaction"}
+			}
+			cs, _ := agent["compaction_settings"].(map[string]any)
+			cur, _ := cs["mode"].(string)
+			model, _ := cs["model"].(string)
+			if cur == "" {
+				cur = "(default)"
+			}
+			if model == "" {
+				model = "(default)"
+			}
+			return mgmtMsg{entry: &entry{kind: entryCommand, cmdInput: "/compaction", text: kvBlock([][2]string{
+				{"mode", cur + "  (set: /compaction all|sliding_window)"},
+				{"model", model},
+			})}}
+		}
+	}
+	if mode != "all" && mode != "sliding_window" {
+		return func() tea.Msg { return mgmtMsg{err: fmt.Errorf("usage: /compaction [all|sliding_window]")} }
+	}
+	return func() tea.Msg {
+		agent, err := cli.AgentRetrieveRaw(context.Background())
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/compaction"}
+		}
+		cs, _ := agent["compaction_settings"].(map[string]any)
+		model, _ := cs["model"].(string)
+		if strings.TrimSpace(model) == "" {
+			model = "letta/auto" // native DEFAULT_SUMMARIZATION_MODEL
+		}
+		err = cli.UpdateAgent(context.Background(), map[string]any{
+			"compaction_settings": map[string]any{"mode": mode, "model": model},
+		})
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/compaction"}
+		}
+		return mgmtMsg{infoTxt: "compaction mode → " + mode}
+	}
+}
+
+// ── /experiments ──
+
+func cmdExperiments(m *model, args string) tea.Cmd {
+	cli := m.cli
+	fields := strings.Fields(args)
+	if len(fields) == 2 && (fields[1] == "on" || fields[1] == "off") {
+		id, enable := fields[0], fields[1] == "on"
+		return func() tea.Msg {
+			exps, err := cli.SetExperiment(context.Background(), id, enable)
+			if err != nil {
+				return mgmtMsg{err: err, errWrap: "/experiments"}
+			}
+			return mgmtMsg{entry: &entry{kind: entryCommand, cmdInput: "/experiments", text: renderExperiments(exps)}}
+		}
+	}
+	if len(fields) > 0 {
+		return func() tea.Msg { return mgmtMsg{err: fmt.Errorf("usage: /experiments [<id> on|off]")} }
+	}
+	return func() tea.Msg {
+		exps, err := cli.Experiments(context.Background())
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/experiments"}
+		}
+		if len(exps) == 0 {
+			return mgmtMsg{infoTxt: "no experiments available"}
+		}
+		return mgmtMsg{entry: &entry{kind: entryCommand, cmdInput: "/experiments", text: renderExperiments(exps)}}
+	}
+}
+
+func renderExperiments(exps []protocol.ExperimentSnapshot) string {
+	rows := make([][2]string, 0, len(exps))
+	for _, e := range exps {
+		state := "off"
+		if e.Enabled {
+			state = "ON"
+		}
+		rows = append(rows, [2]string{e.ID, state + "  " + compactOneLine(e.Description, 90)})
+	}
+	return kvBlock(rows)
+}
+
+// ── /sleeptime ──
+
+func cmdSleeptime(m *model, args string) tea.Cmd {
+	cli := m.cli
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return func() tea.Msg {
+			rs, err := cli.ReflectionSettings(context.Background())
+			if err != nil {
+				return mgmtMsg{err: err, errWrap: "/sleeptime"}
+			}
+			if rs == nil {
+				return mgmtMsg{infoTxt: "no reflection settings reported"}
+			}
+			detail := rs.Trigger
+			if rs.Trigger == "step-count" {
+				detail += fmt.Sprintf(" (every %d steps)", rs.StepCount)
+			}
+			return mgmtMsg{entry: &entry{kind: entryCommand, cmdInput: "/sleeptime", text: kvBlock([][2]string{
+				{"trigger", detail + "  (set: /sleeptime off|step-count [N]|compaction-event)"},
+			})}}
+		}
+	}
+	trigger := fields[0]
+	stepCount := 0
+	switch trigger {
+	case "off", "compaction-event":
+	case "step-count":
+		stepCount = 50
+		if len(fields) > 1 {
+			n, err := strconv.Atoi(fields[1])
+			if err != nil || n <= 0 {
+				return func() tea.Msg { return mgmtMsg{err: fmt.Errorf("usage: /sleeptime step-count <N>")} }
+			}
+			stepCount = n
+		}
+	default:
+		return func() tea.Msg {
+			return mgmtMsg{err: fmt.Errorf("usage: /sleeptime [off|step-count [N]|compaction-event]")}
+		}
+	}
+	return func() tea.Msg {
+		rs, err := cli.SetReflectionSettings(context.Background(), trigger, stepCount, "global")
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/sleeptime"}
+		}
+		detail := trigger
+		if rs != nil && rs.Trigger == "step-count" {
+			detail += fmt.Sprintf(" (every %d steps)", rs.StepCount)
+		}
+		return mgmtMsg{infoTxt: "reflection trigger → " + detail}
+	}
+}
+
+// ── /system + /personality ──
+//
+// Preset content (system prompts, personality persona/human blocks) lives in
+// the letta-code bundle, deliberately not vendored here: zc shells out to
+// node against the installed package's dist/agent-presets.js (a stable
+// module API) so presets always match the running harness version.
+
+// lettaPackageDir resolves the installed @letta-ai/letta-code package root.
+func lettaPackageDir() (string, error) {
+	bin, err := exec.LookPath("letta")
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(resolved), nil
+}
+
+// presetEval runs a node one-liner against dist/agent-presets.js and returns
+// stdout. The script receives the module as global `p`.
+func presetEval(script string) (string, error) {
+	pkg, err := lettaPackageDir()
+	if err != nil {
+		return "", err
+	}
+	mod := filepath.Join(pkg, "dist", "agent-presets.js")
+	if _, err := os.Stat(mod); err != nil {
+		return "", fmt.Errorf("agent-presets.js not found in letta package: %w", err)
+	}
+	full := fmt.Sprintf("const p = require(%q); %s", mod, script)
+	out, err := exec.Command("node", "-e", full).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return "", fmt.Errorf("node: %s", compactOneLine(string(ee.Stderr), 200))
+		}
+		return "", err
+	}
+	return string(out), nil
+}
+
+var systemPromptPresets = []string{"default", "letta", "source-claude", "source-codex", "source-gemini"}
+
+func cmdSystem(m *model, args string) tea.Cmd {
+	preset := strings.TrimSpace(args)
+	if preset == "" {
+		items := make([]overlayItem, 0, len(systemPromptPresets))
+		for _, id := range systemPromptPresets {
+			items = append(items, overlayItem{id: id, title: id, desc: "switch system prompt preset"})
+		}
+		ov := &overlay{kind: overlayMgmt, title: "system prompt preset", items: items}
+		ov.onSelect = func(m *model, it overlayItem) tea.Cmd {
+			return applySystemPreset(m, it.id)
+		}
+		m.overlay = ov
+		m.layout()
+		return nil
+	}
+	return applySystemPreset(m, preset)
+}
+
+func applySystemPreset(m *model, preset string) tea.Cmd {
+	cli := m.cli
+	agentID := cli.Runtime.AgentID
+	memoryMode := "standard"
+	if m.memoryDir != "" {
+		memoryMode = "local-memfs"
+	}
+	return func() tea.Msg {
+		prompt, err := presetEval(fmt.Sprintf(
+			`process.stdout.write(p.buildSystemPrompt(%q, %q))`, preset, memoryMode))
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/system"}
+		}
+		if strings.TrimSpace(prompt) == "" {
+			return mgmtMsg{err: fmt.Errorf("empty prompt for preset %q", preset), errWrap: "/system"}
+		}
+		if err := cli.UpdateAgent(context.Background(), map[string]any{"system": prompt}); err != nil {
+			return mgmtMsg{err: err, errWrap: "/system"}
+		}
+		// Record the preset WITHOUT hash/version: the harness's managed-prompt
+		// reconciler sees an exact bundled-content match on the next turn and
+		// starts tracking it itself ("legacy preset-only" branch). Writing our
+		// own hash would just risk encoding drift.
+		err = mutateAgentSettingsEntries(agentID, func(entry map[string]any) {
+			entry["systemPromptPreset"] = preset
+			delete(entry, "systemPromptHash")
+			delete(entry, "systemPromptVersion")
+		})
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/system (prompt applied, settings not tracked)"}
+		}
+		_ = cli.ExecuteCommand("reload", "")
+		return mgmtMsg{infoTxt: fmt.Sprintf("system prompt → %s (%d chars); managed tracking resumes next turn", preset, len(prompt))}
+	}
+}
+
+func cmdPersonality(m *model, args string) tea.Cmd {
+	choice := strings.TrimSpace(args)
+	if choice == "" {
+		return func() tea.Msg {
+			out, err := presetEval(`process.stdout.write(JSON.stringify(p.PERSONALITY_OPTIONS))`)
+			if err != nil {
+				return mgmtMsg{err: err, errWrap: "/personality"}
+			}
+			var opts []struct {
+				ID, Label, Description string
+			}
+			if err := json.Unmarshal([]byte(out), &opts); err != nil {
+				return mgmtMsg{err: err, errWrap: "/personality"}
+			}
+			items := make([]overlayItem, 0, len(opts))
+			for _, o := range opts {
+				items = append(items, overlayItem{id: o.ID, title: o.Label + "  (" + o.ID + ")", desc: o.Description})
+			}
+			ov := &overlay{kind: overlayMgmt, title: "personality preset (replaces persona + human memory)", items: items}
+			ov.onSelect = func(m *model, it overlayItem) tea.Cmd {
+				return confirmPersonality(m, it.id)
+			}
+			return mgmtMsg{overlay: ov}
+		}
+	}
+	return confirmPersonality(m, choice)
+}
+
+func confirmPersonality(m *model, id string) tea.Cmd {
+	ok := false
+	mf := &mgmtForm{title: "personality"}
+	mf.form = form.New(
+		form.NewConfirm(fmt.Sprintf("switch to %q? This REPLACES system/persona.md and system/human.md in agent memory (git history keeps the old ones).", id)).
+			Affirmative("switch").Negative("cancel").Value(&ok),
+	)
+	mf.onDone = func(m *model) tea.Cmd {
+		if !ok {
+			m.appendEntry(&entry{kind: entryInfo, text: "personality switch cancelled"})
+			return nil
+		}
+		cli := m.cli
+		return func() tea.Msg {
+			out, err := presetEval(fmt.Sprintf(
+				`p.buildCreateAgentRequestForPersonality({personalityId:%q}).then(r=>{
+					const bl = {}; for (const b of r.memory_blocks||[]) bl[b.label]={value:b.value,description:b.description||""};
+					process.stdout.write(JSON.stringify(bl));
+				})`, id))
+			if err != nil {
+				return mgmtMsg{err: err, errWrap: "/personality"}
+			}
+			var blocks map[string]struct{ Value, Description string }
+			if err := json.Unmarshal([]byte(out), &blocks); err != nil {
+				return mgmtMsg{err: err, errWrap: "/personality"}
+			}
+			// Native canonical paths (personality.ts): system/persona.md + system/human.md.
+			paths := map[string]string{"persona": "system/persona.md", "human": "system/human.md"}
+			var applied []string
+			for label, path := range paths {
+				b, okb := blocks[label]
+				if !okb || strings.TrimSpace(b.Value) == "" {
+					continue
+				}
+				content := "---\ndescription: " + strings.ReplaceAll(b.Description, "\n", " ") + "\n---\n\n" + b.Value
+				if _, err := cli.MemoryWrite(context.Background(), path, content,
+					"personality: switch to "+id+" ("+path+")"); err != nil {
+					return mgmtMsg{err: fmt.Errorf("%s: %w", path, err), errWrap: "/personality"}
+				}
+				applied = append(applied, path)
+			}
+			if len(applied) == 0 {
+				return mgmtMsg{err: fmt.Errorf("preset %q has no persona/human blocks", id), errWrap: "/personality"}
+			}
+			return mgmtMsg{infoTxt: "personality → " + id + " (" + strings.Join(applied, ", ") + "); takes effect on next prompt recompile (/recompile)"}
+		}
+	}
+	return func() tea.Msg { return mgmtMsg{form: mf} }
+}
+
+// ── /reflect ──
+//
+// Runs a reflection pass via the HEADLESS `letta dream` subcommand (the
+// harness's own machinery; verified to run cleanly alongside an app-server).
+// Reflection takes minutes — the command runs in a background goroutine and
+// posts its result to the transcript when done.
+
+func cmdReflect(m *model, args string) tea.Cmd {
+	cli := m.cli
+	agentID := cli.Runtime.AgentID
+	convID := cli.Runtime.ConversationID
+	instruction := ""
+	fields := strings.Fields(args)
+	for i := 0; i < len(fields); i++ {
+		switch fields[i] {
+		case "--conversation":
+			if i+1 < len(fields) {
+				convID = fields[i+1]
+				i++
+			}
+		default:
+			if instruction != "" {
+				instruction += " "
+			}
+			instruction += fields[i]
+		}
+	}
+	m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf(
+		"reflection started (letta dream · %s) — runs in the background, result lands here", convID)})
+	return func() tea.Msg {
+		cmdArgs := []string{"dream", "--memory", agentID, "--from", convID, "--json"}
+		if instruction != "" {
+			cmdArgs = append(cmdArgs, "-i", instruction)
+		}
+		out, err := exec.Command("letta", cmdArgs...).Output()
+		if err != nil {
+			detail := err.Error()
+			if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+				detail = compactOneLine(string(ee.Stderr), 300)
+			}
+			return mgmtMsg{err: fmt.Errorf("letta dream: %s", detail), errWrap: "/reflect"}
+		}
+		var res struct {
+			Launched bool   `json:"launched"`
+			Success  bool   `json:"success"`
+			Message  string `json:"message"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(out), &res); err != nil {
+			return mgmtMsg{infoTxt: "reflection finished: " + compactOneLine(string(out), 300)}
+		}
+		status := "✓"
+		if !res.Success {
+			status = "✗"
+		}
+		return mgmtMsg{infoTxt: fmt.Sprintf("reflection %s %s", status, res.Message)}
+	}
+}
+
+// ── /memory-repository set|unset|status|push ──
+//
+// Native parity (memory-git.ts): the additional-remote URL lives in the memfs
+// repo's LOCAL git config under letta.memoryRepository.url; the harness's
+// post-commit hook pushes there after every commit and logs to
+// .git/memory-repository-push.log. zc manipulates the same config key with
+// plain git — same box, same repo. It does NOT reinstall the hook (the
+// harness owns that machinery and repairs it on its own operations).
+
+func cmdMemoryRepositoryRemote(m *model, fields []string) tea.Cmd {
+	repo := m.memoryDir
+	if repo == "" {
+		return func() tea.Msg {
+			return mgmtMsg{err: fmt.Errorf("memfs is not enabled for this agent"), errWrap: "/memory-repository"}
+		}
+	}
+	verb := fields[0]
+	const cfgKey = "letta.memoryRepository.url"
+	gitOut := func(args ...string) (string, error) {
+		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	switch verb {
+	case "set":
+		if len(fields) < 2 {
+			return func() tea.Msg { return mgmtMsg{err: fmt.Errorf("usage: /memory-repository set <url>")} }
+		}
+		url := fields[1]
+		return func() tea.Msg {
+			if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+				return mgmtMsg{err: fmt.Errorf("memory repo not initialized at %s", repo), errWrap: "/memory-repository"}
+			}
+			if out, err := gitOut("config", "--local", cfgKey, url); err != nil {
+				return mgmtMsg{err: fmt.Errorf("%s: %s", err, out), errWrap: "/memory-repository set"}
+			}
+			return mgmtMsg{infoTxt: "memory-repository URL set to " + url + " — pushes after every commit (/memory-repository push to push now)"}
+		}
+	case "unset":
+		return func() tea.Msg {
+			// git config --unset exits 5 when the key was never set — fine.
+			out, err := gitOut("config", "--local", "--unset", cfgKey)
+			if err != nil && out != "" {
+				return mgmtMsg{err: fmt.Errorf("%s: %s", err, out), errWrap: "/memory-repository unset"}
+			}
+			return mgmtMsg{infoTxt: "memory-repository URL removed"}
+		}
+	case "status":
+		return func() tea.Msg {
+			url, _ := gitOut("config", "--local", "--get", cfgKey)
+			if url == "" {
+				url = "(not configured)"
+			}
+			rows := [][2]string{{"url", url}, {"repo", repo}}
+			if raw, err := os.ReadFile(filepath.Join(repo, ".git", "memory-repository-push.log")); err == nil {
+				lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+				if n := len(lines); n > 0 {
+					tail := lines[n-1]
+					if n >= 2 {
+						tail = lines[n-2] + "\n" + tail
+					}
+					rows = append(rows, [2]string{"push log", tail})
+				}
+			}
+			return mgmtMsg{entry: &entry{kind: entryCommand, cmdInput: "/memory-repository status", text: kvBlock(rows)}}
+		}
+	case "push":
+		return func() tea.Msg {
+			url, _ := gitOut("config", "--local", "--get", cfgKey)
+			if url == "" {
+				return mgmtMsg{err: fmt.Errorf("no memory-repository URL configured (set one first)"), errWrap: "/memory-repository push"}
+			}
+			branch, err := gitOut("symbolic-ref", "--quiet", "--short", "HEAD")
+			if err != nil || branch == "" {
+				return mgmtMsg{err: fmt.Errorf("memory repo is in a detached HEAD state"), errWrap: "/memory-repository push"}
+			}
+			out, err := gitOut("push", url, branch+":"+branch)
+			if err != nil {
+				return mgmtMsg{err: fmt.Errorf("push failed: %s", compactOneLine(out, 300)), errWrap: "/memory-repository push"}
+			}
+			if out == "" {
+				out = "pushed (no output)"
+			}
+			return mgmtMsg{infoTxt: "memory-repository push ✓ " + compactOneLine(out, 200)}
+		}
+	}
+	return nil
+}
+
+// ── /statusline ──
+//
+// zc's statusline is Go-rendered (the native ~/.letta/extensions/statusline.tsx
+// Ink component cannot run here), so customization is a template string with
+// placeholders, persisted in zc's own config file (~/.letta/zc.json — kept
+// out of settings.json to avoid the app-server's settings cache entirely).
+
+const statuslinePlaceholders = "{mode} {agent} {conversation} {model} {status} {queue} {hints}"
+
+func zcConfigPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".letta", "zc.json"), nil
+}
+
+func readZcConfig() map[string]any {
+	out := map[string]any{}
+	path, err := zcConfigPath()
+	if err != nil {
+		return out
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
+func writeZcConfig(cfg map[string]any) error {
+	path, err := zcConfigPath()
+	if err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func cmdStatusline(m *model, args string) tea.Cmd {
+	arg := strings.TrimSpace(args)
+	switch arg {
+	case "":
+		cur := m.statuslineTemplate
+		if cur == "" {
+			cur = "(default)"
+		}
+		m.appendEntry(&entry{kind: entryCommand, cmdInput: "/statusline", text: kvBlock([][2]string{
+			{"template", cur},
+			{"placeholders", statuslinePlaceholders},
+			{"usage", "/statusline <template> · /statusline reset"},
+		})})
+		return nil
+	case "reset":
+		m.statuslineTemplate = ""
+		cfg := readZcConfig()
+		delete(cfg, "statusline")
+		if err := writeZcConfig(cfg); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "/statusline: " + err.Error()})
+			return nil
+		}
+		m.appendEntry(&entry{kind: entryInfo, text: "statusline reset to default"})
+		return nil
+	default:
+		m.statuslineTemplate = arg
+		cfg := readZcConfig()
+		cfg["statusline"] = arg
+		if err := writeZcConfig(cfg); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "/statusline: " + err.Error()})
+			return nil
+		}
+		m.appendEntry(&entry{kind: entryInfo, text: "statusline template saved"})
+		return nil
+	}
+}
+
+// ── /feedback ──
+//
+// Native parity: POST to Letta's cloud metadata endpoint. Works unauthed or
+// with LETTA_API_KEY; on a local-only setup a rejection is reported honestly.
+
+func cmdFeedback(m *model, args string) tea.Cmd {
+	msg := strings.TrimSpace(args)
+	if msg == "" {
+		text := ""
+		mf := &mgmtForm{title: "feedback"}
+		mf.form = form.New(
+			form.NewText("Feedback for the Letta team (zc adds version/platform context)").Value(&text),
+		)
+		mf.onDone = func(m *model) tea.Cmd {
+			if strings.TrimSpace(text) == "" {
+				m.appendEntry(&entry{kind: entryInfo, text: "feedback cancelled (empty)"})
+				return nil
+			}
+			return sendFeedback(m, strings.TrimSpace(text))
+		}
+		return func() tea.Msg { return mgmtMsg{form: mf} }
+	}
+	return sendFeedback(m, msg)
+}
+
+func sendFeedback(m *model, message string) tea.Cmd {
+	agentID := m.cli.Runtime.AgentID
+	agentName := m.agentName
+	model := m.modelHandle
+	version := m.serverVersion
+	cwd := m.serverCWD
+	return func() tea.Msg {
+		payload := map[string]any{
+			"message":     message,
+			"feature":     "letta-code",
+			"client":      "zeptocode-cli",
+			"agent_id":    agentID,
+			"agent_name":  agentName,
+			"model":       model,
+			"version":     version,
+			"platform":    runtime.GOOS,
+			"local_time":  time.Now().Format(time.RFC1123),
+			"device_type": runtime.GOOS,
+			"cwd":         cwd,
+		}
+		body, _ := json.Marshal(payload)
+		req, err := http.NewRequest("POST", "https://api.letta.com/v1/metadata/feedback", bytes.NewReader(body))
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/feedback"}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if key := os.Getenv("LETTA_API_KEY"); key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return mgmtMsg{err: err, errWrap: "/feedback"}
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			return mgmtMsg{err: fmt.Errorf("feedback endpoint returned %s (a Letta API key may be required)", resp.Status), errWrap: "/feedback"}
+		}
+		return mgmtMsg{infoTxt: "feedback submitted — thank you! (live chat: discord.gg/letta)"}
 	}
 }

@@ -393,3 +393,21 @@ func orUnknown(s string) string {
 	}
 	return s
 }
+
+// AgentRetrieveRaw returns the full agent record as a generic map (for
+// fields zc does not model explicitly, e.g. compaction_settings).
+func (c *Client) AgentRetrieveRaw(ctx context.Context) (map[string]any, error) {
+	cmd := protocol.AgentRetrieveCommand{Type: "agent_retrieve", RequestID: c.nextRequestID(), AgentID: c.Runtime.AgentID}
+	var resp struct {
+		Success bool           `json:"success"`
+		Error   string         `json:"error"`
+		Agent   map[string]any `json:"agent"`
+	}
+	if err := c.mgmtRequest(ctx, cmd.RequestID, cmd, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.Success || resp.Agent == nil {
+		return nil, fmt.Errorf("agent_retrieve failed: %s", orUnknown(resp.Error))
+	}
+	return resp.Agent, nil
+}
