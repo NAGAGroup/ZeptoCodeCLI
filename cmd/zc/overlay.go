@@ -22,6 +22,7 @@ const (
 	overlayCommands
 	overlayJobs
 	overlayAgents
+	overlayModels
 )
 
 type overlayItem struct {

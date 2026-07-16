@@ -167,6 +167,78 @@ type ChangeDeviceStateCommand struct {
 	Payload ChangeDeviceStatePayload `json:"payload"`
 }
 
+type ConversationForkCommand struct {
+	Type           string         `json:"type"` // "conversation_fork"
+	RequestID      string         `json:"request_id"`
+	ConversationID string         `json:"conversation_id"`
+	Body           map[string]any `json:"body,omitempty"`
+}
+
+type ConversationUpdateCommand struct {
+	Type           string         `json:"type"` // "conversation_update"
+	RequestID      string         `json:"request_id"`
+	ConversationID string         `json:"conversation_id"`
+	Body           map[string]any `json:"body"`
+}
+
+type AgentUpdateCommand struct {
+	Type      string         `json:"type"` // "agent_update"
+	RequestID string         `json:"request_id"`
+	AgentID   string         `json:"agent_id"`
+	Body      map[string]any `json:"body"`
+}
+
+type ListModelsCommand struct {
+	Type      string `json:"type"` // "list_models"
+	RequestID string `json:"request_id"`
+	Force     bool   `json:"force,omitempty"`
+}
+
+type UpdateModelPayload struct {
+	ModelID     string `json:"model_id,omitempty"`
+	ModelHandle string `json:"model_handle,omitempty"`
+}
+
+type UpdateModelCommand struct {
+	Type      string             `json:"type"` // "update_model"
+	RequestID string             `json:"request_id"`
+	Runtime   RuntimeScope       `json:"runtime"`
+	Payload   UpdateModelPayload `json:"payload"`
+}
+
+type ModelEntry struct {
+	ID          string `json:"id"`
+	Handle      string `json:"handle"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	IsDefault   bool   `json:"isDefault"`
+	IsFeatured  bool   `json:"isFeatured"`
+	Free        bool   `json:"free"`
+}
+
+type ListModelsResponse struct {
+	Success          bool         `json:"success"`
+	Error            string       `json:"error"`
+	Entries          []ModelEntry `json:"entries"`
+	AvailableHandles []string     `json:"available_handles"`
+}
+
+type UpdateModelResponse struct {
+	Success     bool   `json:"success"`
+	Error       string `json:"error"`
+	AppliedTo   string `json:"applied_to"`
+	ModelID     string `json:"model_id"`
+	ModelHandle string `json:"model_handle"`
+}
+
+// Ack is the generic success/error envelope shared by CRUD responses.
+type Ack struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error"`
+	// conversation_fork_response carries the new conversation reference.
+	Conversation *ConversationSummary `json:"conversation"`
+}
+
 // ── Inbound frames (app-server → client) ──
 
 // Frame is a decoded inbound frame. Exactly one typed field is non-nil;
@@ -186,6 +258,8 @@ type Frame struct {
 	ConversationList     *ConversationListResponse
 	QueueUpdate          *QueueUpdate
 	SubagentUpdate       *SubagentUpdate
+	ListModels           *ListModelsResponse
+	UpdateModel          *UpdateModelResponse
 }
 
 type ConversationSummary struct {
@@ -332,6 +406,12 @@ type Delta struct {
 	ToolName   string          `json:"tool_name"` // client_tool_start
 	ToolArgs   string          `json:"tool_args"`
 
+	// usage_statistics
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+	StepCount        int64 `json:"step_count"`
+
 	// command / slash command lifecycle + status / retry / loop_error
 	CommandID    string `json:"command_id"`
 	Input        string `json:"input"`
@@ -435,6 +515,12 @@ func Decode(raw []byte) (Frame, error) {
 	case "update_subagent_state":
 		f.SubagentUpdate = &SubagentUpdate{}
 		err = json.Unmarshal(raw, f.SubagentUpdate)
+	case "list_models_response":
+		f.ListModels = &ListModelsResponse{}
+		err = json.Unmarshal(raw, f.ListModels)
+	case "update_model_response":
+		f.UpdateModel = &UpdateModelResponse{}
+		err = json.Unmarshal(raw, f.UpdateModel)
 	}
 	return f, err
 }

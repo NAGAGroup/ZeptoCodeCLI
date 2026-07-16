@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -141,6 +142,9 @@ type model struct {
 	serverVersion  string
 	versionWarned  bool
 	serverCWD      string
+	modelHandle    string // set after /model switches; "" until then
+	lastUsage      protocol.Delta
+	sessionTokens  int64
 	ctrlCArmed     time.Time
 	reconnectTried bool
 	spinning       bool
@@ -369,6 +373,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.overlay = &overlay{kind: overlayAgents, title: "switch agent", items: msg.items}
 		m.layout()
+		return m, nil
+
+	case modelsMsg:
+		if msg.err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "model list failed: " + msg.err.Error()})
+			m.refreshViewport()
+			return m, nil
+		}
+		m.overlay = &overlay{kind: overlayModels, title: "switch model", items: msg.items}
+		m.layout()
+		return m, nil
+
+	case modelSwitchedMsg:
+		if msg.err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "model switch failed: " + msg.err.Error()})
+		} else {
+			m.modelHandle = msg.resp.ModelHandle
+			m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf(
+				"model → %s (%s, applied to %s)", msg.resp.ModelID, msg.resp.ModelHandle, msg.resp.AppliedTo)})
+		}
+		m.refreshViewport()
 		return m, nil
 
 	case switchedMsg:
@@ -719,6 +744,61 @@ type agentsMsg struct {
 	err   error
 }
 
+type modelsMsg struct {
+	items []overlayItem
+	err   error
+}
+
+type modelSwitchedMsg struct {
+	resp *protocol.UpdateModelResponse
+	err  error
+}
+
+func (m *model) openModelPicker() tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		resp, err := cli.ListModels(context.Background(), false)
+		if err != nil {
+			return modelsMsg{err: err}
+		}
+		available := map[string]bool{}
+		haveAvailability := resp.AvailableHandles != nil
+		for _, h := range resp.AvailableHandles {
+			available[h] = true
+		}
+		var avail, unavail []overlayItem
+		for _, e := range resp.Entries {
+			label := e.Label
+			if label == "" {
+				label = e.ID
+			}
+			marks := ""
+			if e.IsDefault {
+				marks += " ★"
+			}
+			if e.Free {
+				marks += " (free)"
+			}
+			it := overlayItem{id: e.ID, title: label + marks, desc: e.Handle + "  " + e.Description}
+			if haveAvailability && !available[e.Handle] {
+				it.title = it.title + "  ⊘ no key"
+				unavail = append(unavail, it)
+			} else {
+				avail = append(avail, it)
+			}
+		}
+		return modelsMsg{items: append(avail, unavail...)}
+	}
+}
+
+func (m *model) switchModel(payload protocol.UpdateModelPayload) tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		resp, err := cli.UpdateModel(context.Background(), payload)
+		return modelSwitchedMsg{resp: resp, err: err}
+	}
+}
+
 func (m *model) openAgentPicker() tea.Cmd {
 	cli := m.cli
 	return func() tea.Msg {
@@ -783,6 +863,135 @@ var clientCommands = []clientCommand{
 		default:
 			m.cycleMode()
 		}
+		return nil
+	}},
+	{"model", "switch model: /model [id-or-handle]", func(m *model, args string) tea.Cmd {
+		args = strings.TrimSpace(args)
+		if args == "" {
+			return m.openModelPicker()
+		}
+		payload := protocol.UpdateModelPayload{ModelID: args}
+		if strings.Contains(args, "/") {
+			payload = protocol.UpdateModelPayload{ModelHandle: args}
+		}
+		return m.switchModel(payload)
+	}},
+	{"fork", "fork this conversation and switch to the fork", func(m *model, _ string) tea.Cmd {
+		cli := m.cli
+		return func() tea.Msg {
+			forkID, err := cli.Fork(context.Background())
+			if err != nil {
+				return switchedMsg{err: err}
+			}
+			if err := cli.SwitchConversation(context.Background(), forkID); err != nil {
+				return switchedMsg{err: err}
+			}
+			hist, _ := cli.MessagesList(context.Background())
+			return switchedMsg{conversationID: forkID, history: hist}
+		}
+	}},
+	{"title", "set conversation title: /title <text>", func(m *model, args string) tea.Cmd {
+		if strings.TrimSpace(args) == "" {
+			m.appendEntry(&entry{kind: entryError, text: "usage: /title <text>"})
+			return nil
+		}
+		if err := m.cli.UpdateConversation(context.Background(), map[string]any{"title": strings.TrimSpace(args)}); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: err.Error()})
+		} else {
+			m.appendEntry(&entry{kind: entryInfo, text: "title set"})
+		}
+		return nil
+	}},
+	{"rename", "rename this agent: /rename <name>", func(m *model, args string) tea.Cmd {
+		if strings.TrimSpace(args) == "" {
+			m.appendEntry(&entry{kind: entryError, text: "usage: /rename <name>"})
+			return nil
+		}
+		if err := m.cli.UpdateAgent(context.Background(), map[string]any{"name": strings.TrimSpace(args)}); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: err.Error()})
+		} else {
+			m.appendEntry(&entry{kind: entryInfo, text: "agent renamed to " + strings.TrimSpace(args)})
+		}
+		return nil
+	}},
+	{"cd", "change tool working directory: /cd <path>", func(m *model, args string) tea.Cmd {
+		path := strings.TrimSpace(args)
+		if path == "" {
+			m.appendEntry(&entry{kind: entryInfo, text: "cwd: " + m.serverCWD})
+			return nil
+		}
+		if strings.HasPrefix(path, "~") {
+			if home, err := os.UserHomeDir(); err == nil {
+				path = home + strings.TrimPrefix(path, "~")
+			}
+		}
+		if !filepath.IsAbs(path) && m.serverCWD != "" {
+			path = filepath.Join(m.serverCWD, path)
+		}
+		if err := m.cli.ChangeCWD(path); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: err.Error()})
+		}
+		// confirmation arrives via update_device_status
+		return nil
+	}},
+	{"usage", "show session usage and runtime info", func(m *model, _ string) tea.Cmd {
+		model := m.modelHandle
+		if model == "" {
+			model = "(switch with /model to see handle)"
+		}
+		version := m.serverVersion
+		if version == "" {
+			version = "unknown"
+		}
+		usage := fmt.Sprintf("total=%d prompt=%d completion=%d steps=%d",
+			m.lastUsage.TotalTokens, m.lastUsage.PromptTokens,
+			m.lastUsage.CompletionTokens, m.lastUsage.StepCount)
+		m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf(
+			"agent: %s\nconversation: %s\nmodel: %s\nmode: %s\ncwd: %s\nletta-code: %s (zc tested %sx)\nlast-step usage: %s\nsession output tokens: %d",
+			m.cli.Runtime.AgentID, m.cli.Runtime.ConversationID, model, m.mode,
+			m.serverCWD, version, testedLettaCode, usage, m.sessionTokens)})
+		return nil
+	}},
+	{"export", "export transcript to a file: /export [path]", func(m *model, args string) tea.Cmd {
+		path := strings.TrimSpace(args)
+		if path == "" {
+			path = filepath.Join(os.TempDir(), fmt.Sprintf("zc-%s.md", m.cli.Runtime.ConversationID))
+		}
+		var b strings.Builder
+		for _, e := range m.entries {
+			switch e.kind {
+			case entryUser:
+				b.WriteString("## you\n\n" + e.text + "\n\n")
+			case entryAssistant:
+				b.WriteString("## agent\n\n" + e.text + "\n\n")
+			case entryTool:
+				b.WriteString("`⚒ " + e.toolName + " " + compactOneLine(e.toolArgs.String(), 120) + " → " + e.toolStatus + "`\n\n")
+			}
+		}
+		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "export failed: " + err.Error()})
+		} else {
+			m.appendEntry(&entry{kind: entryInfo, text: "exported to " + path})
+		}
+		return nil
+	}},
+	{"subagents", "list subagent activity", func(m *model, _ string) tea.Cmd {
+		if len(m.subagents) == 0 {
+			m.appendEntry(&entry{kind: entryInfo, text: "no subagent activity this session"})
+			return nil
+		}
+		var b strings.Builder
+		for i := range m.subagents {
+			s := &m.subagents[i]
+			line := fmt.Sprintf("⚙ %s [%s] %s — %dk tok, %ds",
+				s.SubagentType, s.Status, compactOneLine(s.Description, 60),
+				s.TotalTokens/1000, s.DurationMs/1000)
+			if s.Error != "" {
+				line += " · error: " + compactOneLine(s.Error, 60)
+			}
+			b.WriteString(line + "\n")
+		}
+		m.appendEntry(&entry{kind: entryInfo, text: strings.TrimRight(b.String(), "\n")})
 		return nil
 	}},
 	{"help", "toggle keybinding help", func(m *model, _ string) tea.Cmd {
@@ -891,6 +1100,8 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.startRuntimeCmd(it.id)
 			}
 			return m, m.switchAgent(it.id)
+		case overlayModels:
+			return m, m.switchModel(protocol.UpdateModelPayload{ModelID: it.id})
 		case overlayJobs:
 			// informational; nothing to launch
 		}
@@ -1195,6 +1406,10 @@ func (m *model) handleDelta(d *protocol.Delta) {
 
 	case "loop_error":
 		m.appendEntry(&entry{kind: entryError, text: d.Message})
+
+	case "usage_statistics":
+		m.lastUsage = *d
+		m.sessionTokens += d.CompletionTokens
 
 	case "stop_reason":
 		m.closeStreaming()

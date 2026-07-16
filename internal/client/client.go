@@ -409,6 +409,123 @@ func (c *Client) SwitchAgent(ctx context.Context, agent string) error {
 	return c.StartRuntime(ctx, agent)
 }
 
+// ackRequest sends a request and decodes the generic success/error envelope.
+func (c *Client) ackRequest(ctx context.Context, requestID string, v any) (*protocol.Ack, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(reqCtx, requestID, v)
+	if err != nil {
+		return nil, err
+	}
+	var ack protocol.Ack
+	if err := json.Unmarshal(f.Raw, &ack); err != nil {
+		return nil, err
+	}
+	if !ack.Success {
+		msg := ack.Error
+		if msg == "" {
+			msg = "unknown error"
+		}
+		return nil, fmt.Errorf("%s failed: %s", f.Type, msg)
+	}
+	return &ack, nil
+}
+
+// Fork forks the current conversation and returns the new conversation id.
+func (c *Client) Fork(ctx context.Context) (string, error) {
+	cmd := protocol.ConversationForkCommand{
+		Type:           "conversation_fork",
+		RequestID:      c.nextRequestID(),
+		ConversationID: c.Runtime.ConversationID,
+	}
+	ack, err := c.ackRequest(ctx, cmd.RequestID, cmd)
+	if err != nil {
+		return "", err
+	}
+	if ack.Conversation == nil || ack.Conversation.ID == "" {
+		return "", fmt.Errorf("conversation_fork returned no conversation")
+	}
+	return ack.Conversation.ID, nil
+}
+
+// UpdateConversation patches the current conversation (e.g. {"title": ...}).
+func (c *Client) UpdateConversation(ctx context.Context, body map[string]any) error {
+	cmd := protocol.ConversationUpdateCommand{
+		Type:           "conversation_update",
+		RequestID:      c.nextRequestID(),
+		ConversationID: c.Runtime.ConversationID,
+		Body:           body,
+	}
+	_, err := c.ackRequest(ctx, cmd.RequestID, cmd)
+	return err
+}
+
+// UpdateAgent patches the current agent (e.g. {"name": ...}).
+func (c *Client) UpdateAgent(ctx context.Context, body map[string]any) error {
+	cmd := protocol.AgentUpdateCommand{
+		Type:      "agent_update",
+		RequestID: c.nextRequestID(),
+		AgentID:   c.Runtime.AgentID,
+		Body:      body,
+	}
+	_, err := c.ackRequest(ctx, cmd.RequestID, cmd)
+	return err
+}
+
+// ListModels fetches the model catalog with availability info.
+func (c *Client) ListModels(ctx context.Context, force bool) (*protocol.ListModelsResponse, error) {
+	cmd := protocol.ListModelsCommand{Type: "list_models", RequestID: c.nextRequestID(), Force: force}
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(reqCtx, cmd.RequestID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("client: list_models: %w", err)
+	}
+	resp := f.ListModels
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil && resp.Error != "" {
+			msg = resp.Error
+		}
+		return nil, fmt.Errorf("client: list_models failed: %s", msg)
+	}
+	return resp, nil
+}
+
+// UpdateModel switches the model by catalog id or direct handle.
+func (c *Client) UpdateModel(ctx context.Context, payload protocol.UpdateModelPayload) (*protocol.UpdateModelResponse, error) {
+	cmd := protocol.UpdateModelCommand{
+		Type:      "update_model",
+		RequestID: c.nextRequestID(),
+		Runtime:   c.Runtime,
+		Payload:   payload,
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	f, err := c.request(reqCtx, cmd.RequestID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("client: update_model: %w", err)
+	}
+	resp := f.UpdateModel
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil && resp.Error != "" {
+			msg = resp.Error
+		}
+		return nil, fmt.Errorf("client: update_model failed: %s", msg)
+	}
+	return resp, nil
+}
+
+// ChangeCWD changes the working directory for this conversation's tools.
+func (c *Client) ChangeCWD(path string) error {
+	return c.send(protocol.ChangeDeviceStateCommand{
+		Type:    "change_device_state",
+		Runtime: c.Runtime,
+		Payload: protocol.ChangeDeviceStatePayload{CWD: path},
+	})
+}
+
 // SendUserMessage submits a user turn.
 func (c *Client) SendUserMessage(text string) error {
 	return c.send(protocol.NewUserMessage(c.Runtime, text))
