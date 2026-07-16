@@ -54,9 +54,13 @@ type entry struct {
 	toolCallID string
 	toolArgs   strings.Builder
 	toolStatus string // "", "running", "success", "error", "denied", "allowed"
-	toolReturn string // trimmed tool output, shown when ctrl+o enabled
+	toolReturn string // trimmed tool output body (ctrl+o expands)
 	// command entries
 	cmdInput string
+	// streaming state: finished flips when the entry stops streaming (part
+	// of the cache key so the final full render replaces split renders).
+	finished bool
+	stream   *streamMD
 	// render cache: every kind caches its final rendered block, keyed on
 	// width + content + display state (see model.renderEntry)
 	cachedRender string
@@ -1449,7 +1453,8 @@ func (m *model) handleDelta(d *protocol.Delta) {
 				e.toolStatus = d.Status
 			}
 			if ret := strings.TrimSpace(d.ToolReturnText()); ret != "" {
-				e.toolReturn = truncateLines(ret, 6, 400)
+				// Keep enough for the expanded card view.
+				e.toolReturn = truncateLines(ret, toolBodyExpandedLines+1, 6000)
 			}
 		}
 
@@ -1499,6 +1504,13 @@ func (m *model) handleDelta(d *protocol.Delta) {
 }
 
 func (m *model) closeStreaming() {
+	if m.openAssistant != nil {
+		m.openAssistant.finished = true
+		m.openAssistant.stream = nil // final render is a clean full render
+	}
+	if m.openReasoning != nil {
+		m.openReasoning.finished = true
+	}
 	m.openAssistant = nil
 	m.openReasoning = nil
 }
@@ -1618,9 +1630,9 @@ func (m *model) markdownRenderer(width int) *glamour.TermRenderer {
 // the list-level line cache: content lengths + every display toggle that
 // affects output.
 func (m *model) entryCacheKey(e *entry) string {
-	return fmt.Sprintf("%d|%d|%d|%s|%v|%v",
+	return fmt.Sprintf("%d|%d|%d|%s|%v|%v|%v",
 		len(e.text), e.toolArgs.Len(), len(e.toolReturn),
-		e.toolStatus, m.showReasoning, m.showToolOutput)
+		e.toolStatus, m.showReasoning, m.showToolOutput, e.finished)
 }
 
 // renderEntry renders one entry with caching: only entries whose content
@@ -1636,8 +1648,14 @@ func (m *model) renderEntry(e *entry, w int) string {
 	case entryUser:
 		out = wrap.Render(rail(theme.User) + styleUser.Render("you ▸ ") + e.text)
 	case entryAssistant:
-		md := ""
-		if r := m.markdownRenderer(w - 2); r != nil {
+		var md string
+		if !e.finished && e == m.openAssistant {
+			// Streaming: stable-prefix cache renders only the tail.
+			if e.stream == nil {
+				e.stream = &streamMD{}
+			}
+			md = m.renderStreamingMarkdown(e.stream, e.text, w-2)
+		} else if r := m.markdownRenderer(w - 2); r != nil {
 			if rendered, err := r.Render(e.text); err == nil {
 				md = strings.Trim(rendered, "\n")
 			}
@@ -1645,7 +1663,7 @@ func (m *model) renderEntry(e *entry, w int) string {
 		if md == "" {
 			md = e.text
 		}
-		out = rail(theme.Agent) + styleAgent.Render("agent ▸") + "\n" + md
+		out = styleAgent.Render(iconAgent+" agent") + "\n" + md
 	case entryReasoning:
 		if m.showReasoning {
 			out = wrap.Render(styleReasoning.Render("· " + e.text))
@@ -1654,11 +1672,7 @@ func (m *model) renderEntry(e *entry, w int) string {
 				"· reasoning (%d chars — ctrl+r expands)", len(e.text))))
 		}
 	case entryTool:
-		line := m.renderToolLine(e)
-		if m.showToolOutput && e.toolReturn != "" {
-			line += "\n" + styleInfo.Render(indentLines(e.toolReturn, "  │ "))
-		}
-		out = wrap.Render(line)
+		out = wrap.Render(m.renderToolCard(e, w))
 	case entryCommand:
 		out = wrap.Render(styleAccent.Render("⌁ "+e.cmdInput) + "\n" + e.text)
 	case entryDoc:
@@ -1694,21 +1708,6 @@ func (m *model) renderEntry(e *entry, w int) string {
 	e.cachedRender = out
 	e.cachedKey = key
 	return out
-}
-
-func (m *model) renderToolLine(e *entry) string {
-	args := compactOneLine(e.toolArgs.String(), 70)
-	label := fmt.Sprintf("⚒ %s %s", e.toolName, args)
-	switch e.toolStatus {
-	case "success", "allowed":
-		return styleToolOK.Render(label + " ✓")
-	case "error", "denied":
-		return styleToolErr.Render(label + " ✗ " + e.toolStatus)
-	case "awaiting approval":
-		return styleTool.Render(label + " ⏸ awaiting approval")
-	default:
-		return styleTool.Render(label + " …")
-	}
 }
 
 func renderDiffs(diffs []protocol.DiffPreview, maxLines int) string {

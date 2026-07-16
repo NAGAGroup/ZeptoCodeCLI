@@ -7,9 +7,22 @@ import (
 	"image/color"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/exp/charmtone"
 
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/protocol"
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/ui/form"
+)
+
+// Icons (after crush's icon set).
+const (
+	iconToolPending = "●"
+	iconToolOK      = "✓"
+	iconToolErr     = "×"
+	iconToolWait    = "◍"
+	iconAgent       = "●"
+	iconUser        = "▌"
+	iconQueue       = "⧗"
+	iconSubagent    = "⚙"
 )
 
 type themeT struct {
@@ -30,18 +43,19 @@ var theme themeT
 // initTheme resolves the palette and builds every style. Must run before
 // the first render (called from main after background detection).
 func initTheme(isDark bool) {
+	// The charmtone palette (crush's), dark-first with legible light picks.
 	ld := lipgloss.LightDark(isDark)
 	theme = themeT{
-		User:   ld(lipgloss.Color("#0087af"), lipgloss.Color("#5fd7ff")), // cyan
-		Agent:  ld(lipgloss.Color("#008700"), lipgloss.Color("#87d787")), // green
-		Tool:   ld(lipgloss.Color("#af8700"), lipgloss.Color("#d7d787")), // yellow
-		OK:     ld(lipgloss.Color("#008700"), lipgloss.Color("#5fd75f")),
-		Danger: ld(lipgloss.Color("#d70000"), lipgloss.Color("#ff5f5f")),
-		Warn:   ld(lipgloss.Color("#af5f00"), lipgloss.Color("#ffaf5f")),
-		Dim:    ld(lipgloss.Color("#8a8a8a"), lipgloss.Color("#6c6c6c")),
-		Accent: ld(lipgloss.Color("#5f00af"), lipgloss.Color("#af87ff")), // purple
-		Text:   ld(lipgloss.Color("#262626"), lipgloss.Color("#dadada")),
-		Blue:   ld(lipgloss.Color("#0087af"), lipgloss.Color("#5fafd7")),
+		User:   ld(charmtone.Ox, charmtone.Malibu),      // blue
+		Agent:  ld(charmtone.Guac, charmtone.Julep),     // green
+		Tool:   ld(charmtone.Mustard, charmtone.Zest),   // yellow
+		OK:     ld(charmtone.Guac, charmtone.Julep),
+		Danger: ld(charmtone.Sriracha, charmtone.Cherry),
+		Warn:   ld(charmtone.Cumin, charmtone.Citron),
+		Dim:    ld(charmtone.Squid, charmtone.Smoke),
+		Accent: ld(charmtone.Violet, charmtone.Charple), // purple
+		Text:   ld(charmtone.Char, charmtone.Salt),
+		Blue:   ld(charmtone.Sapphire, charmtone.Malibu),
 	}
 
 	styleUser = lipgloss.NewStyle().Foreground(theme.User).Bold(true)
@@ -50,6 +64,9 @@ func initTheme(isDark bool) {
 	styleTool = lipgloss.NewStyle().Foreground(theme.Tool)
 	styleToolOK = lipgloss.NewStyle().Foreground(theme.OK)
 	styleToolErr = lipgloss.NewStyle().Foreground(theme.Danger)
+	styleToolName = lipgloss.NewStyle().Foreground(theme.Text).Bold(true)
+	styleToolParam = lipgloss.NewStyle().Foreground(theme.Dim)
+	styleToolBody = lipgloss.NewStyle().Foreground(theme.Dim)
 	styleInfo = lipgloss.NewStyle().Foreground(theme.Dim)
 	styleError = lipgloss.NewStyle().Foreground(theme.Danger).Bold(true)
 	styleAccent = lipgloss.NewStyle().Foreground(theme.Accent)
@@ -104,6 +121,9 @@ var (
 	styleTool      lipgloss.Style
 	styleToolOK    lipgloss.Style
 	styleToolErr   lipgloss.Style
+	styleToolName  lipgloss.Style
+	styleToolParam lipgloss.Style
+	styleToolBody  lipgloss.Style
 	styleInfo      lipgloss.Style
 	styleError     lipgloss.Style
 	styleAccent    lipgloss.Style
