@@ -402,6 +402,13 @@ func (c *Client) SwitchConversation(ctx context.Context, conversationID string) 
 	return c.runtimeStart(ctx, c.Runtime.AgentID)
 }
 
+// SwitchAgent restarts the runtime on a different agent (name or id) with a
+// fresh conversation and updates c.Runtime.
+func (c *Client) SwitchAgent(ctx context.Context, agent string) error {
+	c.opts.ConversationID = ""
+	return c.StartRuntime(ctx, agent)
+}
+
 // SendUserMessage submits a user turn.
 func (c *Client) SendUserMessage(text string) error {
 	return c.send(protocol.NewUserMessage(c.Runtime, text))

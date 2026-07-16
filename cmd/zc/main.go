@@ -361,6 +361,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.layout()
 		return m, nil
 
+	case agentsMsg:
+		if msg.err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "agent list failed: " + msg.err.Error()})
+			m.refreshViewport()
+			return m, nil
+		}
+		m.overlay = &overlay{kind: overlayAgents, title: "switch agent", items: msg.items}
+		m.layout()
+		return m, nil
+
 	case switchedMsg:
 		if msg.err != nil {
 			m.appendEntry(&entry{kind: entryError, text: "switch failed: " + msg.err.Error()})
@@ -593,6 +603,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+p":
 		return m, m.openConversationPicker()
+	case "ctrl+a":
+		return m, m.openAgentPicker()
 	case "ctrl+k":
 		m.openCommandPalette()
 		return m, nil
@@ -639,8 +651,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.history = append(m.history, text)
 		m.historyIdx = len(m.history)
 		if strings.HasPrefix(text, "/") {
-			m.dispatchSlashCommand(text)
-			return m, nil
+			return m, m.dispatchSlashCommand(text)
 		}
 		m.closeStreaming()
 		m.appendEntry(&entry{kind: entryUser, text: text})
@@ -703,6 +714,88 @@ type conversationsMsg struct {
 	err   error
 }
 
+type agentsMsg struct {
+	items []overlayItem
+	err   error
+}
+
+func (m *model) openAgentPicker() tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		agents, err := cli.ListAgents(context.Background())
+		if err != nil {
+			return agentsMsg{err: err}
+		}
+		items := make([]overlayItem, 0, len(agents))
+		for _, a := range agents {
+			items = append(items, overlayItem{id: a.ID, title: a.Name, desc: a.ID})
+		}
+		return agentsMsg{items: items}
+	}
+}
+
+// switchAgent restarts the runtime on another agent (fresh conversation),
+// carrying the current permission mode.
+func (m *model) switchAgent(agentID string) tea.Cmd {
+	cli := m.cli
+	mode := m.mode
+	return func() tea.Msg {
+		switch mode {
+		case protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted:
+			cli.SetMode(mode)
+		}
+		if err := cli.SwitchAgent(context.Background(), agentID); err != nil {
+			return switchedMsg{err: err}
+		}
+		return switchedMsg{conversationID: cli.Runtime.ConversationID}
+	}
+}
+
+// ── client-side slash commands ──
+//
+// The server only executes a small remote allowlist (clear, compact, …) plus
+// mod commands; everything else the native CLI implements client-side. These
+// are zc's client-side equivalents, mapped onto protocol operations.
+
+type clientCommand struct {
+	id   string
+	desc string
+	run  func(m *model, args string) tea.Cmd
+}
+
+var clientCommands = []clientCommand{
+	{"agents", "switch to another agent", func(m *model, _ string) tea.Cmd {
+		return m.openAgentPicker()
+	}},
+	{"conversations", "switch conversation", func(m *model, _ string) tea.Cmd {
+		return m.openConversationPicker()
+	}},
+	{"new", "start a fresh conversation", func(m *model, _ string) tea.Cmd {
+		return m.switchConversation("")
+	}},
+	{"mode", "set permission mode: /mode standard|acceptEdits|unrestricted", func(m *model, args string) tea.Cmd {
+		switch protocol.PermissionMode(strings.TrimSpace(args)) {
+		case protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted:
+			target := protocol.PermissionMode(strings.TrimSpace(args))
+			if err := m.cli.ChangeMode(target); err == nil {
+				m.mode = target
+			}
+		default:
+			m.cycleMode()
+		}
+		return nil
+	}},
+	{"help", "toggle keybinding help", func(m *model, _ string) tea.Cmd {
+		m.showHelp = !m.showHelp
+		m.layout()
+		return nil
+	}},
+	{"quit", "exit zc", func(m *model, _ string) tea.Cmd {
+		m.quitting = true
+		return tea.Quit
+	}},
+}
+
 func (m *model) openConversationPicker() tea.Cmd {
 	cli := m.cli
 	return func() tea.Msg {
@@ -729,10 +822,13 @@ func (m *model) openConversationPicker() tea.Cmd {
 	}
 }
 
-// knownCommands merges server built-ins and mod commands for the palette
-// and completion.
+// knownCommands merges zc client commands, mod commands, and server
+// built-ins for the palette and completion.
 func (m *model) knownCommands() []overlayItem {
 	var items []overlayItem
+	for _, c := range clientCommands {
+		items = append(items, overlayItem{id: c.id, title: "/" + c.id, desc: c.desc + " (zc)"})
+	}
 	for _, c := range m.modCmds {
 		desc := c.Description
 		if c.Args != "" {
@@ -790,8 +886,11 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			m.refreshCompletions()
 		case overlayAgents:
-			// startup picker: launch the chosen runtime
-			return m, m.startRuntimeCmd(it.id)
+			if m.phase != phaseChat {
+				// startup picker: launch the chosen runtime
+				return m, m.startRuntimeCmd(it.id)
+			}
+			return m, m.switchAgent(it.id)
 		case overlayJobs:
 			// informational; nothing to launch
 		}
@@ -852,9 +951,17 @@ func (m *model) cycleMode() {
 	m.mode = next
 }
 
-func (m *model) dispatchSlashCommand(text string) {
+func (m *model) dispatchSlashCommand(text string) tea.Cmd {
 	name := strings.TrimPrefix(strings.Fields(text)[0], "/")
 	args := strings.TrimSpace(strings.TrimPrefix(text, "/"+name))
+	// zc client-side commands take precedence.
+	for _, c := range clientCommands {
+		if c.id == name {
+			cmd := c.run(m, args)
+			m.refreshViewport()
+			return cmd
+		}
+	}
 	known := false
 	for _, c := range m.knownCommands() {
 		if c.id == name {
@@ -865,7 +972,7 @@ func (m *model) dispatchSlashCommand(text string) {
 	if !known {
 		m.appendEntry(&entry{kind: entryError, text: "unknown command: /" + name + " (ctrl+k lists commands)"})
 		m.refreshViewport()
-		return
+		return nil
 	}
 	m.closeStreaming()
 	m.appendEntry(&entry{kind: entryUser, text: text})
@@ -873,6 +980,7 @@ func (m *model) dispatchSlashCommand(text string) {
 		m.appendEntry(&entry{kind: entryError, text: "command failed: " + err.Error()})
 	}
 	m.refreshViewport()
+	return nil
 }
 
 func (m *model) resolveApproval(req *protocol.ControlRequest, decision protocol.ApprovalDecision) {
@@ -1185,6 +1293,12 @@ func (m *model) refreshViewport() {
 	}
 }
 
+// glamourStyle is resolved ONCE in main() before bubbletea owns the
+// terminal. glamour's WithAutoStyle queries the terminal background (OSC);
+// doing that mid-session makes the query RESPONSE arrive on stdin where it
+// gets parsed as keystrokes — the "escape codes typed into the input" bug.
+var glamourStyle = "dark"
+
 // markdownRenderer returns a width-matched glamour renderer, rebuilt on
 // resize.
 func (m *model) markdownRenderer(width int) *glamour.TermRenderer {
@@ -1192,7 +1306,7 @@ func (m *model) markdownRenderer(width int) *glamour.TermRenderer {
 		return m.markdown
 	}
 	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
+		glamour.WithStandardStyle(glamourStyle),
 		glamour.WithWordWrap(width),
 		glamour.WithEmoji(),
 	)
@@ -1516,6 +1630,13 @@ func main() {
 		os.Exit(1)
 	}
 	defer logFile.Close()
+
+	// Resolve terminal background ONCE, pre-tea: this both fixes glamour's
+	// style and primes termenv's cache so no adaptive-color code queries
+	// the terminal mid-session (see glamourStyle).
+	if !lipgloss.HasDarkBackground() {
+		glamourStyle = "light"
+	}
 
 	// Connection, agent pick, and runtime start all happen inside the TUI
 	// (phase state machine) — no stdout preamble.

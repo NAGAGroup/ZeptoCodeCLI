@@ -13,6 +13,7 @@ type keymapT struct {
 	Quit          key.Binding
 	Palette       key.Binding
 	Conversations key.Binding
+	Agents        key.Binding
 	Jobs          key.Binding
 	Reasoning     key.Binding
 	ToolOutput    key.Binding
@@ -32,6 +33,7 @@ var keys = keymapT{
 	Quit:          key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "quit (2× mid-turn)")),
 	Palette:       key.NewBinding(key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "command palette")),
 	Conversations: key.NewBinding(key.WithKeys("ctrl+p"), key.WithHelp("ctrl+p", "conversations")),
+	Agents:        key.NewBinding(key.WithKeys("ctrl+a"), key.WithHelp("ctrl+a", "switch agent")),
 	Jobs:          key.NewBinding(key.WithKeys("ctrl+j"), key.WithHelp("ctrl+j", "jobs/broker panel")),
 	Reasoning:     key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "toggle reasoning")),
 	ToolOutput:    key.NewBinding(key.WithKeys("ctrl+o"), key.WithHelp("ctrl+o", "toggle tool output")),
@@ -53,7 +55,7 @@ func (k keymapT) ShortHelp() []key.Binding {
 func (k keymapT) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Send, k.Newline, k.HistoryUp, k.Complete, k.ClearOrAbort, k.Quit},
-		{k.Palette, k.Conversations, k.Jobs, k.ScrollUp},
+		{k.Palette, k.Conversations, k.Agents, k.Jobs, k.ScrollUp},
 		{k.Mode, k.Reasoning, k.ToolOutput, k.Help},
 	}
 }
