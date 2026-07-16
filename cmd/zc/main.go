@@ -17,17 +17,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/huh"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/glamour/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/client"
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/protocol"
+	"github.com/NAGAGroup/ZeptoCodeCLI/internal/ui/form"
 )
 
 // ── entry model ──
@@ -297,7 +297,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.layout()
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
 	case connectDoneMsg:
@@ -337,8 +337,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinning = false
 		return m, nil // stop ticking when idle
 
-	case tea.MouseMsg:
-		// Wheel scrolls the transcript; everything else is ignored.
+	case tea.MouseWheelMsg:
+		// Wheel scrolls the transcript; other mouse events are ignored.
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		return m, cmd
@@ -450,20 +450,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.applyMgmtMsg(msg)
 	}
 
-	// huh's internal messages (from Init/its own cmds) must reach the form.
+	// Form-internal messages (cursor blink etc.) must reach the form.
 	if m.question != nil {
-		form, cmd := m.question.form.Update(msg)
-		if f, ok := form.(*huh.Form); ok {
-			m.question.form = f
-		}
+		cmd := m.question.form.Update(msg)
 		m.finishQuestionIfDone()
 		return m, cmd
 	}
 	if m.mgmt != nil {
-		form, cmd := m.mgmt.form.Update(msg)
-		if f, ok := form.(*huh.Form); ok {
-			m.mgmt.form = f
-		}
+		cmd := m.mgmt.form.Update(msg)
 		if done := m.finishMgmtIfDone(); done != nil {
 			return m, tea.Batch(cmd, done)
 		}
@@ -477,11 +471,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// finishQuestionIfDone submits the answers once the huh form reports
-// completion — which can happen on huh's own async messages, not only on
-// the keypress that triggered it.
+// finishQuestionIfDone submits the answers once the form reports
+// completion — which can happen on the form's own async messages, not only
+// on the keypress that triggered it.
 func (m *model) finishQuestionIfDone() {
-	if m.question == nil || m.question.form.State != huh.StateCompleted {
+	if m.question == nil || m.question.form.State() != form.StateCompleted {
 		return
 	}
 	qf := m.question
@@ -544,7 +538,7 @@ func (m *model) autosizeInput() {
 	}
 }
 
-func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Startup phases: only the agent picker (and quitting) are interactive.
 	if m.phase != phaseChat {
 		if msg.String() == "ctrl+c" || (msg.String() == "esc" && m.overlay == nil) {
@@ -576,10 +570,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refreshViewport()
 			return m, nil
 		}
-		form, cmd := m.question.form.Update(msg)
-		if f, ok := form.(*huh.Form); ok {
-			m.question.form = f
-		}
+		cmd := m.question.form.Update(msg)
 		m.finishQuestionIfDone()
 		return m, cmd
 	}
@@ -597,10 +588,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refreshViewport()
 			return m, nil
 		}
-		form, cmd := m.mgmt.form.Update(msg)
-		if f, ok := form.(*huh.Form); ok {
-			m.mgmt.form = f
-		}
+		cmd := m.mgmt.form.Update(msg)
 		if done := m.finishMgmtIfDone(); done != nil {
 			return m, tea.Batch(cmd, done)
 		}
@@ -1112,7 +1100,7 @@ func (m *model) openCommandPalette() {
 	m.layout()
 }
 
-func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleOverlayKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	o := m.overlay
 	switch msg.String() {
 	case "esc", "ctrl+c":
@@ -1167,8 +1155,8 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	if msg.Type == tea.KeyRunes {
-		o.filter += string(msg.Runes)
+	if msg.Text != "" {
+		o.filter += msg.Text
 		o.clampSel()
 	}
 	return m, nil
@@ -1527,7 +1515,7 @@ func (m *model) renderQuestion() string {
 	}
 	title := styleAccent.Render("agent asks") + styleInfo.Render("  (esc dismisses = deny)")
 	return styleModal.BorderForeground(theme.Accent).Width(w).
-		Render(title + "\n\n" + m.question.form.View())
+		Render(title + "\n\n" + m.question.form.View(w-2))
 }
 
 func (m *model) renderMgmtForm() string {
@@ -1537,7 +1525,7 @@ func (m *model) renderMgmtForm() string {
 	}
 	title := styleAccent.Render(m.mgmt.title) + styleInfo.Render("  (esc cancels)")
 	return styleModal.BorderForeground(theme.Accent).Width(w).
-		Render(title + "\n\n" + m.mgmt.form.View())
+		Render(title + "\n\n" + m.mgmt.form.View(w-2))
 }
 
 func (m *model) layout() {
@@ -1550,11 +1538,11 @@ func (m *model) layout() {
 		vpH = 3
 	}
 	if !m.ready {
-		m.viewport = viewport.New(m.width, vpH)
+		m.viewport = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(vpH))
 		m.ready = true
 	} else {
-		m.viewport.Width = m.width
-		m.viewport.Height = vpH
+		m.viewport.SetWidth(m.width)
+		m.viewport.SetHeight(vpH)
 	}
 	m.input.SetWidth(m.width - 2)
 	m.refreshViewport()
@@ -1578,7 +1566,7 @@ func (m *model) refreshViewport() {
 		if vpH < 3 {
 			vpH = 3
 		}
-		m.viewport.Height = vpH
+		m.viewport.SetHeight(vpH)
 		m.viewport.GotoBottom()
 	}
 }
@@ -1842,7 +1830,16 @@ func (m *model) activityLines() string {
 	return strings.Join(lines, "\n")
 }
 
-func (m *model) View() string {
+// View declares terminal features (alt screen, mouse) and delegates content
+// rendering to viewContent — the v2 declarative style.
+func (m *model) View() tea.View {
+	v := tea.NewView(m.viewContent())
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	return v
+}
+
+func (m *model) viewContent() string {
 	if m.quitting {
 		return ""
 	}
@@ -1949,11 +1946,13 @@ func main() {
 	defer logFile.Close()
 
 	// Resolve terminal background ONCE, pre-tea: this both fixes glamour's
-	// style and primes termenv's cache so no adaptive-color code queries
+	// style and resolves the whole theme so no adaptive-color code queries
 	// the terminal mid-session (see glamourStyle).
-	if !lipgloss.HasDarkBackground() {
+	isDark := lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
+	if !isDark {
 		glamourStyle = "light"
 	}
+	initTheme(isDark)
 
 	// Connection, agent pick, and runtime start all happen inside the TUI
 	// (phase state machine) — no stdout preamble.
@@ -1966,7 +1965,7 @@ func main() {
 		ServerLog:      logFile,
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m) // alt screen + mouse mode are declared in View()
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
 		os.Exit(1)

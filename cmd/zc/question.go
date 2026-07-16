@@ -13,9 +13,8 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/charmbracelet/huh"
-
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/protocol"
+	"github.com/NAGAGroup/ZeptoCodeCLI/internal/ui/form"
 )
 
 const otherSentinel = "\x00other"
@@ -33,8 +32,8 @@ type questionSpec struct {
 type questionForm struct {
 	req       *protocol.ControlRequest
 	questions []questionSpec
-	form      *huh.Form
-	inited    bool       // huh forms must Init() through the tea loop
+	form      *form.Form
+	inited    bool       // forms must Init() through the tea loop
 	single    []string   // bound values for single-select questions
 	multi     [][]string // bound values for multi-select questions
 	other     []string   // bound values for per-question "Other" inputs
@@ -65,48 +64,45 @@ func newQuestionForm(req *protocol.ControlRequest) *questionForm {
 		other:     make([]string, len(input.Questions)),
 	}
 
-	var groups []*huh.Group
+	var fields []form.Field
 	for i, q := range input.Questions {
 		i := i
 		title := q.Question
 		if q.Header != "" {
 			title = q.Header + ": " + q.Question
 		}
-		var opts []huh.Option[string]
+		var opts []form.Option
 		for _, o := range q.Options {
 			label := o.Label
 			if o.Description != "" {
 				label += "  — " + compactOneLine(o.Description, 60)
 			}
-			opts = append(opts, huh.NewOption(label, o.Label))
+			opts = append(opts, form.Option{Label: label, Value: o.Label})
 		}
-		opts = append(opts, huh.NewOption("Other (type an answer)", otherSentinel))
+		opts = append(opts, form.Option{Label: "Other (type an answer)", Value: otherSentinel})
 		if q.MultiSelect {
-			groups = append(groups, huh.NewGroup(
-				huh.NewMultiSelect[string]().Title(title).Options(opts...).Value(&qf.multi[i]),
-			))
+			fields = append(fields,
+				form.NewMultiSelect(title).Options(opts...).Value(&qf.multi[i]))
 		} else {
-			groups = append(groups, huh.NewGroup(
-				huh.NewSelect[string]().Title(title).Options(opts...).Value(&qf.single[i]),
-			))
+			fields = append(fields,
+				form.NewSelect(title).Options(opts...).Value(&qf.single[i]))
 		}
 		// Free-text follow-up, shown only when "Other" was chosen.
-		groups = append(groups, huh.NewGroup(
-			huh.NewInput().Title("Your answer").Value(&qf.other[i]),
-		).WithHideFunc(func() bool {
-			if input.Questions[i].MultiSelect {
-				for _, v := range qf.multi[i] {
-					if v == otherSentinel {
-						return false
+		fields = append(fields, form.NewInput("Your answer").Value(&qf.other[i]).
+			WithHide(func() bool {
+				if input.Questions[i].MultiSelect {
+					for _, v := range qf.multi[i] {
+						if v == otherSentinel {
+							return false
+						}
 					}
+					return true
 				}
-				return true
-			}
-			return qf.single[i] != otherSentinel
-		}))
+				return qf.single[i] != otherSentinel
+			}))
 	}
 
-	qf.form = huh.NewForm(groups...).WithShowHelp(true)
+	qf.form = form.New(fields...)
 	return qf
 }
 

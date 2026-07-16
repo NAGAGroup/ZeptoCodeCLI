@@ -16,27 +16,28 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/huh"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/protocol"
+	"github.com/NAGAGroup/ZeptoCodeCLI/internal/ui/form"
 )
 
-// ── mgmt form: a huh form in the modal slot with a completion callback ──
+// ── mgmt form: a form in the modal slot with a completion callback ──
 
 type mgmtForm struct {
-	form   *huh.Form
+	form   *form.Form
 	title  string
 	inited bool
 	onDone func(m *model) tea.Cmd // runs when the form completes
 }
 
-// finishMgmtIfDone submits the form result once huh reports completion.
+// finishMgmtIfDone submits the form result once it reports completion.
 func (m *model) finishMgmtIfDone() tea.Cmd {
-	if m.mgmt == nil || m.mgmt.form.State != huh.StateCompleted {
+	if m.mgmt == nil || m.mgmt.form.State() != form.StateCompleted {
 		return nil
 	}
 	mf := m.mgmt
@@ -157,12 +158,12 @@ func openSecretEditForm(m *model, key string) tea.Cmd {
 		}
 		val := current
 		mf := &mgmtForm{title: "secret: " + key}
-		mf.form = huh.NewForm(huh.NewGroup(
-			huh.NewInput().Title(key).
+		mf.form = form.New(
+			form.NewInput(key).
 				Description("value hidden; submit empty to keep unchanged").
-				EchoMode(huh.EchoModePassword).
+				Password().
 				Value(&val),
-		)).WithShowHelp(true)
+		)
 		mf.onDone = func(m *model) tea.Cmd {
 			if val == "" || val == current {
 				m.appendEntry(&entry{kind: entryInfo, text: "secret " + key + " unchanged"})
@@ -190,9 +191,9 @@ func applySecret(m *model, set map[string]string, unset []string, what string) t
 func openConfirmForm(m *model, title string, onYes func(m *model) tea.Cmd) tea.Cmd {
 	ok := false
 	mf := &mgmtForm{title: title}
-	mf.form = huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().Title(title).Affirmative("yes").Negative("no").Value(&ok),
-	)).WithShowHelp(true)
+	mf.form = form.New(
+		form.NewConfirm(title).Affirmative("yes").Negative("no").Value(&ok),
+	)
 	mf.onDone = func(m *model) tea.Cmd {
 		if !ok {
 			m.appendEntry(&entry{kind: entryInfo, text: "cancelled"})
@@ -489,61 +490,57 @@ func openProviderForm(m *model, p protocol.ConnectProviderEntry) tea.Cmd {
 
 	const actConnect, actDisconnect, actCancel = "connect", "disconnect", "cancel"
 	action := actConnect
-	methodIdx := 0
+	methodChoice := "0"
 	// Bound values: one slice per method, one string per field.
 	values := make([][]string, len(methods))
 	for i := range methods {
 		values[i] = make([]string, len(methods[i].Fields))
 	}
 
-	var groups []*huh.Group
+	var fields []form.Field
 	if connected {
-		opts := []huh.Option[string]{
-			huh.NewOption("update credentials", actConnect),
-			huh.NewOption("disconnect", actDisconnect),
-			huh.NewOption("cancel", actCancel),
-		}
-		actGroup := huh.NewGroup(huh.NewSelect[string]().
-			Title(p.DisplayName + " is connected").Options(opts...).Value(&action))
-		groups = append(groups, actGroup)
+		fields = append(fields, form.NewSelect(p.DisplayName+" is connected").
+			Options(
+				form.Option{Label: "update credentials", Value: actConnect},
+				form.Option{Label: "disconnect", Value: actDisconnect},
+				form.Option{Label: "cancel", Value: actCancel},
+			).Value(&action))
 	}
 	if len(methods) > 1 {
-		var mopts []huh.Option[int]
+		var mopts []form.Option
 		for i, am := range methods {
 			label := am.Label
 			if label == "" {
 				label = am.ID
 			}
-			mopts = append(mopts, huh.NewOption(label, i))
+			mopts = append(mopts, form.Option{Label: label, Value: strconv.Itoa(i)})
 		}
-		groups = append(groups, huh.NewGroup(huh.NewSelect[int]().
-			Title("auth method").Options(mopts...).Value(&methodIdx),
-		).WithHideFunc(func() bool { return action != actConnect }))
+		fields = append(fields, form.NewSelect("auth method").
+			Options(mopts...).Value(&methodChoice).
+			WithHide(func() bool { return action != actConnect }))
 	}
+	nInputs := 0
 	for i := range methods {
 		i := i
-		var fields []huh.Field
 		for j := range methods[i].Fields {
 			j := j
 			f := methods[i].Fields[j]
-			in := huh.NewInput().Title(f.Label).Value(&values[i][j])
+			in := form.NewInput(f.Label).Value(&values[i][j]).
+				WithHide(func() bool {
+					return action != actConnect || methodChoice != strconv.Itoa(i)
+				})
 			if f.Placeholder != "" {
 				in = in.Placeholder(f.Placeholder)
 			}
 			if f.Secret {
-				in = in.EchoMode(huh.EchoModePassword)
+				in = in.Password()
 			}
 			fields = append(fields, in)
+			nInputs++
 		}
-		if len(fields) == 0 {
-			continue
-		}
-		groups = append(groups, huh.NewGroup(fields...).WithHideFunc(func() bool {
-			return action != actConnect || methodIdx != i
-		}))
 	}
 
-	if len(groups) == 0 {
+	if len(fields) == 0 || (!connected && nInputs == 0) {
 		m.appendEntry(&entry{kind: entryInfo, text: p.DisplayName + ": nothing to configure over the wire"})
 		m.refreshViewport()
 		return nil
@@ -551,7 +548,7 @@ func openProviderForm(m *model, p protocol.ConnectProviderEntry) tea.Cmd {
 
 	cli := m.cli
 	mf := &mgmtForm{title: "connect: " + p.DisplayName}
-	mf.form = huh.NewForm(groups...).WithShowHelp(true)
+	mf.form = form.New(fields...)
 	mf.onDone = func(m *model) tea.Cmd {
 		switch action {
 		case actCancel:
@@ -565,6 +562,10 @@ func openProviderForm(m *model, p protocol.ConnectProviderEntry) tea.Cmd {
 				return mgmtMsg{infoTxt: p.DisplayName + " disconnected (model availability may have changed — /model to refresh)"}
 			}
 		default:
+			methodIdx, _ := strconv.Atoi(methodChoice)
+			if methodIdx < 0 || methodIdx >= len(methods) {
+				methodIdx = 0
+			}
 			am := methods[methodIdx]
 			fieldMap := map[string]string{}
 			for j, f := range am.Fields {
@@ -650,12 +651,11 @@ func cmdMemory(m *model, args string) tea.Cmd {
 			current, _ := cli.MemoryRead(context.Background(), path) // absent file ⇒ empty editor
 			content := current
 			mf := &mgmtForm{title: "edit " + path}
-			mf.form = huh.NewForm(huh.NewGroup(
-				huh.NewText().Title(path).
+			mf.form = form.New(
+				form.NewText(path).
 					Description("edits commit to the agent's memory repo").
-					CharLimit(0).
 					Value(&content),
-			)).WithShowHelp(true)
+			)
 			mf.onDone = func(m *model) tea.Cmd {
 				if content == current {
 					m.appendEntry(&entry{kind: entryInfo, text: path + " unchanged"})
