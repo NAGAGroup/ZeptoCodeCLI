@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -71,10 +72,7 @@ func (m *model) refreshCompletions() {
 			}
 		}
 		sort.SliceStable(out, func(a, b int) bool { return out[a].score < out[b].score })
-		for i, s := range out {
-			if i >= 8 {
-				break
-			}
+		for _, s := range out {
 			m.completion.items = append(m.completion.items, s.it)
 		}
 		m.completion.visible = len(m.completion.items) > 0
@@ -113,7 +111,7 @@ func (m *model) refreshCompletions() {
 			insert: "@" + dir + name,
 			label:  name,
 		})
-		if len(m.completion.items) >= 8 {
+		if len(m.completion.items) >= 24 {
 			break
 		}
 	}
@@ -133,13 +131,26 @@ func (m *model) acceptCompletion() {
 	m.refreshCompletions()
 }
 
+// completionWindow is how many rows the popup shows; the window follows
+// the selection so every item is reachable.
+const completionWindow = 8
+
 func (m *model) renderCompletions() string {
 	c := &m.completion
 	if !c.visible {
 		return ""
 	}
+	start := 0
+	if c.sel >= completionWindow {
+		start = c.sel - completionWindow + 1
+	}
+	end := start + completionWindow
+	if end > len(c.items) {
+		end = len(c.items)
+	}
 	var b strings.Builder
-	for i, it := range c.items {
+	for i := start; i < end; i++ {
+		it := c.items[i]
 		line := it.label
 		if it.desc != "" {
 			line += "  " + compactOneLine(it.desc, m.width-len(it.label)-10)
@@ -150,6 +161,11 @@ func (m *model) renderCompletions() string {
 			b.WriteString(styleCompletion.Render("  " + line))
 		}
 		b.WriteString("\n")
+	}
+	if len(c.items) > end {
+		b.WriteString(styleCompletion.Render(fmt.Sprintf("  … %d more ↓", len(c.items)-end)) + "\n")
+	} else if start > 0 {
+		b.WriteString(styleCompletion.Render("  ↑ more above") + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

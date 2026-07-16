@@ -354,6 +354,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
+	case tea.KeyReleaseMsg:
+		// Terminals with the Kitty keyboard protocol report releases too.
+		// Never route them anywhere: a release reaching the generic input
+		// path used to reset completion selection state.
+		return m, nil
+
 	case connectDoneMsg:
 		if msg.err != nil {
 			m.startupErr = msg.err.Error()
@@ -531,10 +537,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Non-key messages (cursor blink etc.) reach the input but must NOT
+	// touch completion state — a blink tick resetting the selection was
+	// exactly the "picker jumps back to the first entry" bug.
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
-	m.autosizeInput()
-	m.refreshCompletions()
 	return m, cmd
 }
 
@@ -751,6 +758,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// Priority: clear non-empty input, else abort the active turn.
 		if strings.TrimSpace(m.input.Value()) != "" {
 			m.input.Reset()
+			m.completion = completionState{}
 			m.historyIdx = len(m.history)
 			return m, nil
 		}
@@ -836,6 +844,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			m.input.SetValue(m.history[m.historyIdx])
 			m.input.CursorEnd()
+			m.refreshCompletions()
 			return m, nil
 		}
 	case "down":
@@ -853,6 +862,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.input.SetValue(m.history[m.historyIdx])
 				m.input.CursorEnd()
 			}
+			m.refreshCompletions()
 			return m, nil
 		}
 	case "pgup":
@@ -875,8 +885,15 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Typing path: refresh completions only when the content changed, so
+	// pure navigation keys never clobber the selection.
+	prev := m.input.Value()
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	m.autosizeInput()
+	if m.input.Value() != prev {
+		m.refreshCompletions()
+	}
 	return m, cmd
 }
 
