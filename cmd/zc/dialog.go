@@ -39,9 +39,6 @@ func (m *model) activeDialog() string {
 	case m.question != nil:
 		return dialogBox("agent asks", "esc dismisses = deny",
 			m.question.form.View(w-4), w)
-	case m.mgmt != nil:
-		return dialogBox(m.mgmt.title, "esc cancels",
-			m.mgmt.form.View(w-4), w)
 	case m.pager != nil:
 		return m.pager.render(m.width, m.height)
 	case m.overlay != nil:

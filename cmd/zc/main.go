@@ -8,11 +8,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -100,7 +103,7 @@ func waitForFrame(frames <-chan protocol.Frame) tea.Cmd {
 // ── model ──
 
 type model struct {
-	cli       *client.Client
+	cli       *client.StdioClient
 	logPath   string
 	port      int
 	serverLog *os.File
@@ -136,7 +139,6 @@ type model struct {
 	overlay            *overlay
 	completion         completionState
 	question           *questionForm // AskUserQuestion takes over the modal slot
-	mgmt               *mgmtForm     // management-command forms share that slot
 	memoryDir          string        // agent MemFS root (from device_status)
 	helpModel          help.Model
 	showHelp           bool
@@ -168,7 +170,7 @@ type model struct {
 	// startup state machine (phase 4): the TUI owns connection + agent pick
 	phase      int // phaseConnecting | phasePicking | phaseChat
 	startupErr string
-	startOpts  client.Options
+	startOpts  client.StdioOptions
 }
 
 const (
@@ -182,7 +184,7 @@ const (
 // visible warning instead of silent breakage.
 const testedLettaCode = "0.28."
 
-func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) *model {
+func newModel(cli *client.StdioClient, logPath string, port int, serverLog *os.File) *model {
 	ta := textarea.New()
 	ta.Placeholder = "Message the agent · / for commands · @ for files · ctrl+g for help"
 	ta.Prompt = ""
@@ -222,13 +224,31 @@ func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) 
 	return mm
 }
 
+// readZcConfig reads ~/.letta/zc.json for zc-local config (statusline template).
+func readZcConfig() map[string]any {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return map[string]any{}
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".letta", "zc.json"))
+	if err != nil {
+		return map[string]any{}
+	}
+	var cfg map[string]any
+	_ = json.Unmarshal(raw, &cfg)
+	if cfg == nil {
+		cfg = map[string]any{}
+	}
+	return cfg
+}
+
 // readReasoningTabSetting reads reasoningTabCycleEnabled from settings.json.
 func readReasoningTabSetting() bool {
-	path, err := globalSettingsPath()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(filepath.Join(home, ".letta", "settings.json"))
 	if err != nil {
 		return false
 	}
@@ -293,7 +313,7 @@ func (m *model) Init() tea.Cmd {
 }
 
 type connectDoneMsg struct {
-	cli    *client.Client
+	cli    *client.StdioClient
 	agents []overlayItem // non-nil ⇒ user must pick
 	err    error
 }
@@ -305,22 +325,23 @@ type runtimeReadyMsg struct {
 	err     error
 }
 
-// connectCmd spawns the app-server and either starts the runtime directly
-// (--agent given) or fetches the agent list for the in-TUI picker.
+// connectCmd spawns the ui-server and either connects directly (--agent
+// given as an agent ID) or fetches the agent list for the in-TUI picker.
 func (m *model) connectCmd() tea.Cmd {
 	opts := m.startOpts
 	return func() tea.Msg {
-		cli, err := client.Connect(context.Background(), opts)
-		if err != nil {
-			return connectDoneMsg{err: err}
-		}
 		if opts.Agent == "" {
-			agents, err := cli.ListAgents(context.Background())
+			// No agent: list agents via headless letta for the picker.
+			agents, err := listAgentsHeadless()
 			if err != nil {
-				cli.Close()
 				return connectDoneMsg{err: err}
 			}
-			return connectDoneMsg{cli: cli, agents: agentOverlayItems(agents)}
+			return connectDoneMsg{agents: agentOverlayItems(agents)}
+		}
+		// Agent given: connect directly (hello handshake starts the runtime).
+		cli, err := client.ConnectStdio(context.Background(), opts)
+		if err != nil {
+			return connectDoneMsg{err: err}
 		}
 		return connectDoneMsg{cli: cli}
 	}
@@ -329,10 +350,21 @@ func (m *model) connectCmd() tea.Cmd {
 // startupConvPicker lists the picked agent's conversations so startup can
 // resume one directly (or begin fresh).
 func (m *model) startupConvPicker(agentID string) tea.Cmd {
-	cli := m.cli
 	return func() tea.Msg {
-		convs, err := cli.ConversationsListFor(context.Background(), agentID)
+		// Connect with the agent to get a StdioClient for listing conversations.
+		cli, err := client.ConnectStdio(context.Background(), client.StdioOptions{
+			Agent:        agentID,
+			UIBin:        m.startOpts.UIBin,
+			UIServerPath: m.startOpts.UIServerPath,
+			CWD:          m.startOpts.CWD,
+			ServerLog:    m.startOpts.ServerLog,
+		})
 		if err != nil {
+			return connectDoneMsg{err: err}
+		}
+		convs, err := cli.ListConversations(context.Background(), agentID)
+		if err != nil {
+			cli.Close()
 			return connectDoneMsg{err: err}
 		}
 		items := []overlayItem{{id: "", title: "(new conversation)"}}
@@ -350,11 +382,12 @@ func (m *model) startupConvPicker(agentID string) tea.Cmd {
 			when := c.LastMessageAt
 			marker := ""
 			if when == "" {
-				// Never had a message — resuming it shows nothing.
 				when, marker = c.UpdatedAt, "  (empty)"
 			}
 			items = append(items, overlayItem{id: c.ID, title: title, desc: c.ID + "  " + when + marker})
 		}
+		// Close this temporary connection; we'll reconnect with the chosen conversation.
+		cli.Close()
 		ov := &overlay{kind: overlayMgmt, title: "choose a conversation", items: items}
 		ov.onSelect = func(m *model, it overlayItem) tea.Cmd {
 			m.startOpts.ConversationID = it.id
@@ -364,40 +397,86 @@ func (m *model) startupConvPicker(agentID string) tea.Cmd {
 	}
 }
 
-// resolveThenConvPicker resolves --agent (possibly a name) to an id and opens
-// the startup conversation picker for it.
-func (m *model) resolveThenConvPicker(agent string) tea.Cmd {
-	cli := m.cli
-	pick := m.startupConvPicker
-	return func() tea.Msg {
-		id, err := cli.ResolveAgent(context.Background(), agent)
-		if err != nil {
-			return connectDoneMsg{err: err}
-		}
-		return pick(id)()
-	}
-}
-
-// startRuntimeCmd starts the runtime for agent and fetches history if resuming.
+// startRuntimeCmd connects to the ui-server with the chosen agent/conversation
+// and fetches history if resuming.
 func (m *model) startRuntimeCmd(agent string) tea.Cmd {
-	cli := m.cli
 	conversation := m.startOpts.ConversationID
+	opts := m.startOpts
 	return func() tea.Msg {
-		// Propagate the picked conversation to the client — its Options
-		// snapshot predates the startup picker, and a stale empty value
-		// means "create a new conversation" (the bug that made startup
-		// resumes land in a fresh empty conversation with no history).
-		cli.SetConversation(conversation)
-		if err := cli.StartRuntime(context.Background(), agent); err != nil {
+		cli, err := client.ConnectStdio(context.Background(), opts)
+		if err != nil {
 			return runtimeReadyMsg{err: err}
 		}
+		m.cli = cli
 		var hist []protocol.Delta
 		var histErr error
 		if conversation != "" {
-			hist, histErr = cli.MessagesList(context.Background())
+			hist, histErr = cli.ListMessages(context.Background())
 		}
 		return runtimeReadyMsg{history: hist, resumed: conversation != "", histErr: histErr}
 	}
+}
+
+// mgmtMsg carries an overlay from a background command (e.g. startup picker).
+type mgmtMsg struct {
+	overlay *overlay
+	text    string
+}
+
+// pagerRequest requests opening the pager modal with given title + content.
+type pagerRequest struct {
+	title   string
+	content string
+	kind    string // "markdown" or "diff"
+}
+
+// listAgentsHeadless shells out to `letta agents list --json` to get agents
+// without spawning a ui-server (needed for the agent picker when no --agent
+// is given).
+func listAgentsHeadless() ([]protocol.AgentSummary, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "letta", "agents", "list", "--json")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		// Fallback: try to list agents from the local backend directory
+		return listAgentsFromBackend()
+	}
+	var agents []protocol.AgentSummary
+	if err := json.Unmarshal(stdout.Bytes(), &agents); err != nil {
+		return listAgentsFromBackend()
+	}
+	return agents, nil
+}
+
+// listAgentsFromBackend reads agent records from the local backend directory.
+func listAgentsFromBackend() ([]protocol.AgentSummary, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	agentsDir := filepath.Join(home, ".letta", "lc-local-backend", "agents")
+	entries, err := os.ReadDir(agentsDir)
+	if err != nil {
+		return nil, err
+	}
+	var agents []protocol.AgentSummary
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(agentsDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var agent protocol.AgentSummary
+		if err := json.Unmarshal(raw, &agent); err == nil && agent.ID != "" {
+			agents = append(agents, agent)
+		}
+	}
+	return agents, nil
 }
 
 // ── update ──
@@ -435,7 +514,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// used to abandon an empty conversation, and picking those later
 			// looked like "history not populating".
 			m.phase = phasePicking
-			return m, m.resolveThenConvPicker(m.startOpts.Agent)
+			return m, m.startupConvPicker(msg.cli.Runtime.AgentID)
 		}
 		return m, m.startRuntimeCmd(m.startOpts.Agent)
 
@@ -604,20 +683,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForFrame(m.cli.Frames)
 
 	case mgmtMsg:
-		return m, m.applyMgmtMsg(msg)
+		if msg.overlay != nil {
+			m.overlay = msg.overlay
+			m.layout()
+		}
+		if msg.text != "" {
+			m.appendEntry(&entry{kind: entryInfo, text: msg.text})
+			m.refreshViewport()
+		}
+		return m, nil
 	}
 
 	// Form-internal messages (cursor blink etc.) must reach the form.
 	if m.question != nil {
 		cmd := m.question.form.Update(msg)
 		m.finishQuestionIfDone()
-		return m, cmd
-	}
-	if m.mgmt != nil {
-		cmd := m.mgmt.form.Update(msg)
-		if done := m.finishMgmtIfDone(); done != nil {
-			return m, tea.Batch(cmd, done)
-		}
 		return m, cmd
 	}
 
@@ -639,7 +719,8 @@ func (m *model) finishQuestionIfDone() {
 	qf := m.question
 	m.question = nil
 	m.layout()
-	if err := m.cli.RespondApproval(qf.req.RequestID, qf.decision()); err != nil {
+	dec := qf.decision()
+	if err := m.cli.SendApprovalResponse(qf.req.RequestID, dec.Behavior, dec.UpdatedInput); err != nil {
 		m.appendEntry(&entry{kind: entryError, text: "answer send failed: " + err.Error()})
 	} else {
 		var parts []string
@@ -666,7 +747,7 @@ func (m *model) loadRuntimeInfo() tea.Cmd {
 		if name, model, err := cli.AgentRetrieve(context.Background()); err == nil {
 			out.agentName, out.model = name, model
 		}
-		if convs, err := cli.ConversationsList(context.Background()); err == nil {
+		if convs, err := cli.ListConversations(context.Background(), cli.Runtime.AgentID); err == nil {
 			for _, c := range convs {
 				if c.ID == cli.Runtime.ConversationID {
 					out.convTitle = c.Title
@@ -679,30 +760,18 @@ func (m *model) loadRuntimeInfo() tea.Cmd {
 }
 
 type reconnectedMsg struct {
-	cli *client.Client
+	cli *client.StdioClient
 	err error
 }
 
-// reconnect respawns the app-server and resumes the same conversation.
+// reconnect respawns the ui-server and resumes the same conversation.
 func (m *model) reconnect() tea.Cmd {
-	mode := m.mode
-	switch mode {
-	case protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted:
-	default:
-		mode = "" // unknown placeholder — let the server default
-	}
-	opts := client.Options{
-		Agent:          m.cli.Runtime.AgentID,
-		ConversationID: m.cli.Runtime.ConversationID,
-		Port:           m.port,
-		Mode:           mode,
-		ServerLog:      m.serverLog,
-	}
+	opts := m.cli.GetOpts()
 	old := m.cli
 	return func() tea.Msg {
 		old.Close()
-		time.Sleep(1 * time.Second)
-		cli, err := client.Start(context.Background(), opts)
+		time.Sleep(500 * time.Millisecond)
+		cli, err := client.ConnectStdio(context.Background(), opts)
 		return reconnectedMsg{cli: cli, err: err}
 	}
 }
@@ -746,10 +815,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			req := m.question.req
 			m.question = nil
 			m.layout()
-			if err := m.cli.RespondApproval(req.RequestID, protocol.ApprovalDecision{
-				Behavior: "deny",
-				Message:  "User dismissed the question form.",
-			}); err != nil {
+			if err := m.cli.SendApprovalResponse(req.RequestID, "deny", nil); err != nil {
 				m.appendEntry(&entry{kind: entryError, text: "deny send failed: " + err.Error()})
 			}
 			m.refreshViewport()
@@ -761,25 +827,6 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Management forms use the same modal slot; esc cancels harmlessly.
-	if m.mgmt != nil {
-		switch msg.String() {
-		case "ctrl+c":
-			m.quitting = true
-			return m, tea.Quit
-		case "esc":
-			m.mgmt = nil
-			m.layout()
-			m.appendEntry(&entry{kind: entryInfo, text: "cancelled"})
-			m.refreshViewport()
-			return m, nil
-		}
-		cmd := m.mgmt.form.Update(msg)
-		if done := m.finishMgmtIfDone(); done != nil {
-			return m, tea.Batch(cmd, done)
-		}
-		return m, cmd
-	}
-
 	// Pager modal: scroll or dismiss.
 	if m.pager != nil {
 		if msg.String() == "ctrl+c" {
@@ -857,7 +904,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.turnActive() {
-			_ = m.cli.Abort()
+			_ = m.cli.SendInterrupt()
 			m.appendEntry(&entry{kind: entryInfo, text: "⏹ abort requested"})
 			m.refreshViewport()
 		}
@@ -917,7 +964,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.closeStreaming()
 		m.appendEntry(&entry{kind: entryUser, text: text})
-		if err := m.cli.SendUserMessage(text); err != nil {
+		if err := m.cli.SendMessage(text); err != nil {
 			m.appendEntry(&entry{kind: entryError, text: "send failed: " + err.Error()})
 		}
 		m.refreshViewport()
@@ -1015,85 +1062,27 @@ type modelSwitchedMsg struct {
 }
 
 func (m *model) openModelPicker() tea.Cmd {
+	// Server returns models as formatted text; send /model as input_submit
+	// and the server will show the catalog as a command_result.
+	m.closeStreaming()
+	m.appendEntry(&entry{kind: entryUser, text: "/model"})
+	m.cli.SendMessage("/model")
+	return nil
+}
+
+func (m *model) switchModel(modelID, modelHandle string) tea.Cmd {
 	cli := m.cli
 	return func() tea.Msg {
-		resp, err := cli.ListModels(context.Background(), false)
-		if err != nil {
-			return modelsMsg{err: err}
-		}
-		available := map[string]bool{}
-		haveAvailability := resp.AvailableHandles != nil
-		for _, h := range resp.AvailableHandles {
-			available[h] = true
-		}
-		var avail, unavail []overlayItem
-		for _, e := range resp.Entries {
-			label := e.Label
-			if label == "" {
-				label = e.ID
-			}
-			// Variants (reasoning efforts etc.) are distinct catalog ids
-			// that often share a label — surface the id so five identical
-			// "Fable 5" rows are tellable apart.
-			if e.ID != "" && !strings.EqualFold(e.ID, label) {
-				label += " [" + e.ID + "]"
-			}
-			marks := ""
-			if e.IsDefault {
-				marks += " ★"
-			}
-			if e.Free {
-				marks += " (free)"
-			}
-			it := overlayItem{id: e.ID, title: label + marks, desc: e.Handle + "  " + e.Description}
-			if haveAvailability && !available[e.Handle] {
-				it.title = it.title + "  ⊘ no key"
-				unavail = append(unavail, it)
-			} else {
-				avail = append(avail, it)
-			}
-		}
-		return modelsMsg{items: append(avail, unavail...)}
+		err := cli.UpdateModel(context.Background(), modelID, modelHandle)
+		return modelSwitchedMsg{err: err}
 	}
 }
 
-func (m *model) switchModel(payload protocol.UpdateModelPayload) tea.Cmd {
-	cli := m.cli
-	return func() tea.Msg {
-		resp, err := cli.UpdateModel(context.Background(), payload)
-		return modelSwitchedMsg{resp: resp, err: err}
-	}
-}
-
-// cycleReasoningVariant switches to the next catalog id sharing the current
-// model handle (reasoning-effort variants share handle+label, differ by id).
+// cycleReasoningVariant is deferred until the server returns structured
+// model catalog data (currently returns formatted text only).
 func (m *model) cycleReasoningVariant() tea.Cmd {
-	cli := m.cli
-	curHandle, curID := m.modelHandle, m.modelID
-	return func() tea.Msg {
-		resp, err := cli.ListModels(context.Background(), false)
-		if err != nil {
-			return modelSwitchedMsg{err: err}
-		}
-		var group []string
-		for _, e := range resp.Entries {
-			if e.Handle != "" && e.Handle == curHandle {
-				group = append(group, e.ID)
-			}
-		}
-		if len(group) < 2 {
-			return modelSwitchedMsg{err: fmt.Errorf("no reasoning variants for %s", curHandle)}
-		}
-		next := group[0]
-		for i, id := range group {
-			if id == curID {
-				next = group[(i+1)%len(group)]
-				break
-			}
-		}
-		out, err := cli.UpdateModel(context.Background(), protocol.UpdateModelPayload{ModelID: next})
-		return modelSwitchedMsg{resp: out, err: err}
-	}
+	m.appendEntry(&entry{kind: entryInfo, text: "reasoning variant cycling requires structured model catalog (not yet available)"})
+	return nil
 }
 
 func (m *model) openAgentPicker() tea.Cmd {
@@ -1110,7 +1099,8 @@ func (m *model) openAgentPicker() tea.Cmd {
 // agentOverlayItems builds picker rows with pinned agents (settings.json
 // agents[].pinned) floated to the top and starred.
 func agentOverlayItems(agents []protocol.AgentSummary) []overlayItem {
-	pinned := pinnedAgentIDs()
+	// Pinned agents feature requires settings_read; return empty for now.
+	pinned := map[string]bool{}
 	var top, rest []overlayItem
 	for _, a := range agents {
 		it := overlayItem{id: a.ID, title: a.Name, desc: a.ID}
@@ -1124,19 +1114,22 @@ func agentOverlayItems(agents []protocol.AgentSummary) []overlayItem {
 	return append(top, rest...)
 }
 
-// switchAgent restarts the runtime on another agent (fresh conversation),
-// carrying the current permission mode.
+// switchAgent kills the current ui-server and reconnects with a new agent
+// (fresh conversation).
 func (m *model) switchAgent(agentID string) tea.Cmd {
-	cli := m.cli
-	mode := m.mode
+	opts := m.cli.GetOpts()
+	old := m.cli
 	return func() tea.Msg {
-		switch mode {
-		case protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted:
-			cli.SetMode(mode)
-		}
-		if err := cli.SwitchAgent(context.Background(), agentID); err != nil {
+		old.Close()
+		time.Sleep(300 * time.Millisecond)
+		newOpts := opts
+		newOpts.Agent = agentID
+		newOpts.ConversationID = ""
+		cli, err := client.ConnectStdio(context.Background(), newOpts)
+		if err != nil {
 			return switchedMsg{err: err}
 		}
+		m.cli = cli
 		return switchedMsg{conversationID: cli.Runtime.ConversationID}
 	}
 }
@@ -1160,13 +1153,6 @@ var clientCommands = []clientCommand{
 	{"conversations", "switch conversation", func(m *model, _ string) tea.Cmd {
 		return m.openConversationPicker()
 	}},
-	// Shadows the ZeptoCode server mod's /jobs on purpose: the native panel
-	// also shows broker status and is available even when the turn is busy.
-	{"jobs", "jobs + broker panel", func(m *model, _ string) tea.Cmd {
-		m.overlay = &overlay{kind: overlayJobs, title: "ZeptoCode jobs + broker", items: jobsOverlayItems()}
-		m.layout()
-		return nil
-	}},
 	{"new", "start a fresh conversation", func(m *model, _ string) tea.Cmd {
 		return m.beginSwitch(m.switchConversation(""))
 	}},
@@ -1185,13 +1171,23 @@ var clientCommands = []clientCommand{
 	{"model", "switch model: /model [id-or-handle]", func(m *model, args string) tea.Cmd {
 		args = strings.TrimSpace(args)
 		if args == "" {
-			return m.openModelPicker()
+			m.closeStreaming()
+			m.appendEntry(&entry{kind: entryUser, text: "/model"})
+			m.cli.SendMessage("/model")
+			return nil
 		}
-		payload := protocol.UpdateModelPayload{ModelID: args}
+		modelID := args
+		modelHandle := ""
 		if strings.Contains(args, "/") {
-			payload = protocol.UpdateModelPayload{ModelHandle: args}
+			modelHandle = args
+			modelID = ""
 		}
-		return m.switchModel(payload)
+		if err := m.cli.UpdateModel(context.Background(), modelID, modelHandle); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: err.Error()})
+		} else {
+			m.appendEntry(&entry{kind: entryInfo, text: "model switched to " + args})
+		}
+		return nil
 	}},
 	{"fork", "fork this conversation and switch to the fork", func(m *model, _ string) tea.Cmd {
 		cli := m.cli
@@ -1200,10 +1196,21 @@ var clientCommands = []clientCommand{
 			if err != nil {
 				return switchedMsg{err: err}
 			}
-			if err := cli.SwitchConversation(context.Background(), forkID); err != nil {
-				return switchedMsg{err: err}
+			opts := cli.GetOpts()
+			cli.Close()
+			newCli, connErr := client.ConnectStdio(context.Background(), client.StdioOptions{
+				Agent:          opts.Agent,
+				ConversationID: forkID,
+				UIBin:          opts.UIBin,
+				UIServerPath:   opts.UIServerPath,
+				CWD:            opts.CWD,
+				ServerLog:      opts.ServerLog,
+			})
+			if connErr != nil {
+				return switchedMsg{err: connErr}
 			}
-			hist, histErr := cli.MessagesList(context.Background())
+			m.cli = newCli
+			hist, histErr := newCli.ListMessages(context.Background())
 			return switchedMsg{conversationID: forkID, history: hist, resumed: true, histErr: histErr}
 		})
 	}},
@@ -1249,43 +1256,6 @@ var clientCommands = []clientCommand{
 		if err := m.cli.ChangeCWD(path); err != nil {
 			m.appendEntry(&entry{kind: entryError, text: err.Error()})
 		}
-		// confirmation arrives via update_device_status
-		return nil
-	}},
-	{"usage", "show session usage and runtime info", func(m *model, _ string) tea.Cmd {
-		model := m.modelHandle
-		if model == "" {
-			model = "(unknown)"
-		}
-		version := m.serverVersion
-		if version == "" {
-			version = "unknown"
-		}
-		agent := m.agentName
-		if agent != "" {
-			agent += "  " + styleInfo.Render(m.cli.Runtime.AgentID)
-		} else {
-			agent = m.cli.Runtime.AgentID
-		}
-		conv := m.convTitle
-		if conv != "" {
-			conv += "  " + styleInfo.Render(m.cli.Runtime.ConversationID)
-		} else {
-			conv = m.cli.Runtime.ConversationID
-		}
-		body := kvBlock([][2]string{
-			{"agent", agent},
-			{"conversation", conv},
-			{"model", model},
-			{"mode", string(m.mode)},
-			{"cwd", m.serverCWD},
-			{"letta-code", fmt.Sprintf("%s (zc tested %sx)", version, testedLettaCode)},
-			{"last step", fmt.Sprintf("%d total · %d prompt · %d completion · %d steps",
-				m.lastUsage.TotalTokens, m.lastUsage.PromptTokens,
-				m.lastUsage.CompletionTokens, m.lastUsage.StepCount)},
-			{"session output", fmt.Sprintf("%d tokens", m.sessionTokens)},
-		})
-		m.appendEntry(&entry{kind: entryCommand, cmdInput: "/usage", text: body})
 		return nil
 	}},
 	{"export", "export transcript to a file: /export [path]", func(m *model, args string) tea.Cmd {
@@ -1301,7 +1271,7 @@ var clientCommands = []clientCommand{
 			case entryAssistant:
 				b.WriteString("## agent\n\n" + e.text + "\n\n")
 			case entryTool:
-				b.WriteString("`⚒ " + e.toolName + " " + compactOneLine(e.toolArgs.String(), 120) + " → " + e.toolStatus + "`\n\n")
+				b.WriteString("`\u2312 " + e.toolName + " " + compactOneLine(e.toolArgs.String(), 120) + " \u2192 " + e.toolStatus + "`\n\n")
 			}
 		}
 		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
@@ -1311,68 +1281,8 @@ var clientCommands = []clientCommand{
 		}
 		return nil
 	}},
-	{"subagents", "list subagent activity", func(m *model, _ string) tea.Cmd {
-		if len(m.subagents) == 0 {
-			m.appendEntry(&entry{kind: entryInfo, text: "no subagent activity this session"})
-			return nil
-		}
-		var b strings.Builder
-		for i := range m.subagents {
-			s := &m.subagents[i]
-			line := fmt.Sprintf("⚙ %s [%s] %s — %dk tok, %ds",
-				s.SubagentType, s.Status, compactOneLine(s.Description, 60),
-				s.TotalTokens/1000, s.DurationMs/1000)
-			if s.Error != "" {
-				line += " · error: " + compactOneLine(s.Error, 60)
-			}
-			b.WriteString(line + "\n")
-		}
-		m.appendEntry(&entry{kind: entryInfo, text: strings.TrimRight(b.String(), "\n")})
-		return nil
-	}},
-	{"secret", "manage agent secrets: /secret [list] | set KEY [VALUE] | unset KEY", cmdSecret},
-	{"skills", "list/enable/disable skills: /skills [list] | enable <path> | disable <name>", cmdSkills},
-	{"connect", "connect model providers: /connect [usage]", cmdConnect},
-	{"memory", "browse agent memory: /memory [list] | view|write|rm <path> | enable", cmdMemory},
-	{"memory-repository", "memory repo: /memory-repository [file] | set <url> | unset | status | push", cmdMemoryRepository},
-	{"mods", "list mods, /mods reload applies changes", cmdMods},
-	{"hooks", "show configured hooks from all settings files", cmdHooks},
-	{"mcp", "MCP status (not wireable on local backend)", cmdMCP},
-	{"profiles", "agent profiles: /profiles [list] | save <name> | rm <name>", cmdProfiles},
-	{"crons", "cron tasks: /crons [list] | trigger <ref> | rm <ref>", cmdCrons},
-	{"tidy", "archive empty conversations across all agents", cmdTidy},
-	{"description", "set agent description: /description <text>", cmdDescription},
-	{"recompile", "recompile the current agent + conversation", cmdRecompile},
-	{"context", "show context window usage", cmdContext},
-	{"bg", "show background processes", cmdBg},
-	{"search", "search messages across agents: /search <query>", cmdSearch},
-	{"pin", "pin the current agent (picker priority)", cmdPinWith(true)},
-	{"unpin", "unpin the current agent", cmdPinWith(false)},
-	{"reasoning-tab", "Tab on empty input cycles reasoning variants: /reasoning-tab on|off", cmdReasoningTab},
-	{"memfs", "memory filesystem: /memfs [status|enable|disable]", cmdMemfs},
-	{"compaction", "compaction mode: /compaction [all|sliding_window]", cmdCompaction},
-	{"experiments", "local experiments: /experiments [<id> on|off]", cmdExperiments},
-	{"sleeptime", "reflection trigger: /sleeptime [off|step-count [N]|compaction-event]", cmdSleeptime},
-	{"system", "switch system prompt preset: /system [preset]", cmdSystem},
-	{"personality", "switch personality preset (replaces persona+human memory)", cmdPersonality},
-	{"reflect", "run a reflection pass: /reflect [--conversation <id>] [instruction]", cmdReflect},
-	{"statusline", "customize the statusline: /statusline [template|reset]", cmdStatusline},
-	{"feedback", "send feedback to the Letta team: /feedback [message]", cmdFeedback},
-	{"skill-creator", "guided skill creation: /skill-creator [description]", func(m *model, args string) tea.Cmd {
-		msg := "Load and follow your \"creating-skills\" skill to guide me through creating a new skill."
-		if strings.TrimSpace(args) != "" {
-			msg += " The skill should: " + strings.TrimSpace(args)
-		}
-		m.closeStreaming()
-		m.appendEntry(&entry{kind: entryUser, text: "/skill-creator " + args})
-		if err := m.cli.SendUserMessage(msg); err != nil {
-			m.appendEntry(&entry{kind: entryError, text: "send failed: " + err.Error()})
-		}
-		return nil
-	}},
-	{"help", "toggle keybinding help", func(m *model, _ string) tea.Cmd {
-		m.showHelp = !m.showHelp
-		m.layout()
+	{"help", "show keybindings and commands", func(m *model, _ string) tea.Cmd {
+		m.showHelp = true
 		return nil
 	}},
 	{"quit", "exit zc", func(m *model, _ string) tea.Cmd {
@@ -1384,7 +1294,7 @@ var clientCommands = []clientCommand{
 func (m *model) openConversationPicker() tea.Cmd {
 	cli := m.cli
 	return func() tea.Msg {
-		convs, err := cli.ConversationsList(context.Background())
+		convs, err := cli.ListConversations(context.Background(), cli.Runtime.AgentID)
 		if err != nil {
 			return conversationsMsg{err: err}
 		}
@@ -1438,14 +1348,8 @@ func (m *model) knownCommands() []overlayItem {
 		seen[c] = true
 		items = append(items, overlayItem{id: c, title: "/" + c, desc: "built-in"})
 	}
-	// Skills are invocable directly: /<skill-name> [instructions].
-	for _, sk := range scanSkills(m.memoryDir, m.serverCWD) {
-		if seen[sk.name] {
-			continue
-		}
-		seen[sk.name] = true
-		items = append(items, overlayItem{id: sk.name, title: "/" + sk.name, desc: "skill · " + compactOneLine(sk.desc, 80)})
-	}
+	// Skills are server-side; the server routes /<skill-name> through its
+	// native command registry. No client-side skill scanning needed.
 	return items
 }
 
@@ -1499,7 +1403,7 @@ func (m *model) handleOverlayKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.beginSwitch(m.switchAgent(it.id))
 		case overlayModels:
-			return m, m.switchModel(protocol.UpdateModelPayload{ModelID: it.id})
+			return m, m.switchModel(it.id, "")
 		case overlayMgmt:
 			if o.onSelect != nil {
 				return m, o.onSelect(m, it)
@@ -1525,23 +1429,22 @@ type switchedMsg struct {
 }
 
 func (m *model) switchConversation(conversationID string) tea.Cmd {
-	cli := m.cli
-	// Carry the CURRENT permission mode into the target conversation —
-	// otherwise new conversations silently reset to the server default
-	// (unrestricted), which reads as "permissions broken".
-	mode := m.mode
+	opts := m.cli.GetOpts()
+	old := m.cli
 	return func() tea.Msg {
-		switch mode {
-		case protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted:
-			cli.SetMode(mode)
-		}
-		if err := cli.SwitchConversation(context.Background(), conversationID); err != nil {
+		old.Close()
+		time.Sleep(300 * time.Millisecond)
+		newOpts := opts
+		newOpts.ConversationID = conversationID
+		cli, err := client.ConnectStdio(context.Background(), newOpts)
+		if err != nil {
 			return switchedMsg{err: err}
 		}
+		m.cli = cli
 		var hist []protocol.Delta
 		var histErr error
 		if conversationID != "" {
-			hist, histErr = cli.MessagesList(context.Background())
+			hist, histErr = cli.ListMessages(context.Background())
 		}
 		return switchedMsg{conversationID: cli.Runtime.ConversationID, history: hist, resumed: conversationID != "", histErr: histErr}
 	}
@@ -1598,24 +1501,14 @@ func (m *model) dispatchSlashCommand(text string) tea.Cmd {
 		}
 	}
 	if !known {
-		// Direct skill invocation (native parity): /<skill-name> [args]
-		// sends a real message asking the agent to load that skill.
-		for _, sk := range scanSkills(m.memoryDir, m.serverCWD) {
-			if sk.name == name {
-				msg := fmt.Sprintf("Load and follow your %q skill", name)
-				if args != "" {
-					msg += ", then: " + args
-				}
-				m.closeStreaming()
-				m.appendEntry(&entry{kind: entryUser, text: "/" + name + " " + args})
-				if err := m.cli.SendUserMessage(msg); err != nil {
-					m.appendEntry(&entry{kind: entryError, text: "send failed: " + err.Error()})
-				}
-				m.refreshViewport()
-				return nil
-			}
+		// Unknown to the client command registry: send as input_submit and
+		// let the server route it (native command registry, mod commands,
+		// or skill invocation all happen server-side).
+		m.closeStreaming()
+		m.appendEntry(&entry{kind: entryUser, text: text})
+		if err := m.cli.SendMessage(text); err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "send failed: " + err.Error()})
 		}
-		m.appendEntry(&entry{kind: entryError, text: "unknown command: /" + name + " (ctrl+k lists commands)"})
 		m.refreshViewport()
 		return nil
 	}
@@ -1630,7 +1523,7 @@ func (m *model) dispatchSlashCommand(text string) tea.Cmd {
 
 func (m *model) resolveApproval(req *protocol.ControlRequest, decision protocol.ApprovalDecision) {
 	m.approvals = m.approvals[1:]
-	if err := m.cli.RespondApproval(req.RequestID, decision); err != nil {
+	if err := m.cli.SendApprovalResponse(req.RequestID, decision.Behavior, decision.UpdatedInput); err != nil {
 		m.appendEntry(&entry{kind: entryError, text: "approval send failed: " + err.Error()})
 	}
 	verdict := "allowed"
@@ -1648,59 +1541,125 @@ func (m *model) resolveApproval(req *protocol.ControlRequest, decision protocol.
 
 func (m *model) handleFrame(f protocol.Frame) {
 	switch {
-	case f.ControlRequest != nil && f.ControlRequest.Request.Subtype == "can_use_tool":
-		m.enqueueApproval(f.ControlRequest)
+	// ── ui-server frames ──
+	case f.HelloResponse != nil:
+		// Hello handshake already processed in ConnectStdio; this is a
+		// duplicate if it reaches here. Ignore.
+		return
 
-	case f.LoopStatus != nil:
-		m.loopStatus = f.LoopStatus.LoopStatus.Status
-
-	case f.DeviceStatus != nil:
-		ds := &f.DeviceStatus.DeviceStatus
-		if ds.Mode != "" {
-			m.mode = ds.Mode
+	case f.DeviceStatusFlat != nil:
+		ds := f.DeviceStatusFlat
+		if ds.PermissionMode != "" {
+			m.mode = ds.PermissionMode
 		}
 		if ds.CWD != "" {
 			m.serverCWD = ds.CWD
 		}
-		if len(ds.SupportedCommands) > 0 {
-			m.supportedCmds = ds.SupportedCommands
+		if ds.AgentName != "" {
+			m.agentName = ds.AgentName
 		}
-		if len(ds.ModCommands) > 0 {
-			m.modCmds = ds.ModCommands
+		if ds.ConversationID != "" {
+			m.cli.Runtime.ConversationID = ds.ConversationID
 		}
-		if ds.MemoryDirectory != "" {
-			m.memoryDir = ds.MemoryDirectory
+		if ds.Model != "" {
+			m.modelHandle = ds.Model
 		}
-		m.bgProcs = ds.BackgroundProcesses
 		if ds.LettaCodeVersion != "" {
 			m.serverVersion = ds.LettaCodeVersion
 			if !m.versionWarned && !strings.HasPrefix(ds.LettaCodeVersion, testedLettaCode) {
 				m.versionWarned = true
 				m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf(
-					"⚠ letta-code %s differs from tested %sx — protocol drift possible (no wire versioning)",
+					"⚠ letta-code %s differs from tested %sx — protocol drift possible",
 					ds.LettaCodeVersion, testedLettaCode)})
 			}
 		}
-		// Approval recovery: a resumed conversation may have approvals that
-		// were pending when the previous client went away.
-		for i := range ds.PendingControlRequests {
-			p := &ds.PendingControlRequests[i]
-			m.enqueueApproval(&protocol.ControlRequest{
-				RequestID: p.RequestID,
-				Request:   p.Request,
-			})
+		// Tools list provides autocomplete data
+		if len(ds.Tools) > 0 {
+			// Tools are available for reference but not used for command catalog
 		}
 
-	case f.QueueUpdate != nil:
-		m.queue = f.QueueUpdate.Queue
+	case f.TurnStart != nil:
+		m.spinning = true
+		m.lastUsage = protocol.Delta{}
 
-	case f.SubagentUpdate != nil:
-		m.subagents = f.SubagentUpdate.Subagents
+	case f.TurnEnd != nil:
+		m.spinning = false
+		m.closeStreaming()
+		if f.TurnEnd.StopReason == "cancelled" {
+			m.appendEntry(&entry{kind: entryInfo, text: "interrupted"})
+		}
 
+	case f.TranscriptUpdate != nil:
+		m.handleDelta(&f.TranscriptUpdate.Chunk)
+
+	case f.TranscriptSync != nil:
+		// Replace transcript with accumulated entries from the server.
+		// This is the authoritative state — reconcile any divergence.
+		if len(f.TranscriptSync.Entries) > 0 {
+			m.resetEntries()
+			for _, te := range f.TranscriptSync.Entries {
+				e := &entry{text: te.Text}
+				switch te.Kind {
+				case "user":
+					e.kind = entryUser
+				case "assistant":
+					e.kind = entryAssistant
+				case "tool_call", "tool_return":
+					e.kind = entryTool
+				case "thinking":
+					e.kind = entryReasoning
+				case "error":
+					e.kind = entryError
+				case "shell":
+					e.kind = entryCommand
+				default:
+					e.kind = entryInfo
+				}
+				m.appendEntry(e)
+			}
+			m.refreshViewport()
+		}
+
+	case f.ControlRequest != nil:
+		m.enqueueApproval(f.ControlRequest)
+
+	case f.CommandResult != nil:
+		kind := entryInfo
+		if !f.CommandResult.Success {
+			kind = entryError
+		}
+		m.appendEntry(&entry{kind: kind, text: f.CommandResult.Output})
+		m.refreshViewport()
+
+	case f.BashOutput != nil:
+		if f.BashOutput.Error != "" {
+			m.appendEntry(&entry{kind: entryError, text: f.BashOutput.Error})
+		} else {
+			m.appendEntry(&entry{kind: entryCommand, text: f.BashOutput.Output})
+		}
+		m.refreshViewport()
+
+	case f.ErrorMsg != nil:
+		m.appendEntry(&entry{kind: entryError, text: f.ErrorMsg.Message})
+		m.refreshViewport()
+
+	case f.OverlayState != nil:
+		// Overlay state from the server — render the top descriptor.
+		if len(f.OverlayState.Stack) > 0 {
+			top := f.OverlayState.Stack[len(f.OverlayState.Stack)-1]
+			items := make([]overlayItem, len(top.Items))
+			for i, it := range top.Items {
+				items[i] = overlayItem{id: it.ID, title: it.Label, desc: it.Description}
+			}
+			m.overlay = &overlay{kind: overlayMgmt, title: top.Title, items: items}
+			m.layout()
+		} else {
+			m.overlay = nil
+			m.layout()
+		}
+
+	// ── Legacy protocol_v2 frames (should not arrive under ui-server) ──
 	case f.StreamDelta != nil:
-		// Subagent token streams never enter the transcript (matches the
-		// native client): their status arrives via update_subagent_state
-		// and renders as activity rollups.
 		if f.StreamDelta.SubagentID != "" {
 			return
 		}
@@ -2328,7 +2287,11 @@ func main() {
 	mode := flag.String("mode", "", "permission mode: standard | acceptEdits | unrestricted (default: server default)")
 	flag.Parse()
 
-	logFile, logPath, err := client.OpenServerLog()
+	// Open a log file for the ui-server's stderr.
+	logDir := filepath.Join(os.Getenv("HOME"), ".letta", "logs")
+	os.MkdirAll(logDir, 0755)
+	logPath := filepath.Join(logDir, "zc-ui-server.log")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot open server log: %v\n", err)
 		os.Exit(1)
@@ -2347,10 +2310,9 @@ func main() {
 	// Connection, agent pick, and runtime start all happen inside the TUI
 	// (phase state machine) — no stdout preamble.
 	m := newModel(nil, logPath, *port, logFile)
-	m.startOpts = client.Options{
+	m.startOpts = client.StdioOptions{
 		Agent:          *agentID,
 		ConversationID: *conversationID,
-		Port:           *port,
 		Mode:           protocol.PermissionMode(*mode),
 		ServerLog:      logFile,
 	}

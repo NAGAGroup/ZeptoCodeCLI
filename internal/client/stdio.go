@@ -1,8 +1,9 @@
 // Package client: stdio transport for the zc ui-server protocol.
 //
 // Spawns `bun ui-server.ts --agent <id>` as a child process and communicates
-// over stdin/stdout (JSON-lines). stderr goes to a log writer. This replaces
-// the WebSocket app-server transport for the zc protocol seam.
+// over stdin/stdout (JSON-lines). stderr goes to a log writer. This is the
+// sole transport for the zc thin-client TUI — the old WebSocket app-server
+// transport has been removed.
 package client
 
 import (
@@ -58,7 +59,6 @@ func ConnectStdio(ctx context.Context, opts StdioOptions) (*StdioClient, error) 
 		opts.UIBin = "bun"
 	}
 	if opts.UIServerPath == "" {
-		// Default: the fork at ~/projects/letta-code
 		opts.UIServerPath = os.ExpandEnv("$HOME/projects/letta-code/src/cli/subcommands/ui-server.ts")
 	}
 	if opts.ServerLog == nil {
@@ -122,30 +122,12 @@ func ConnectStdio(ctx context.Context, opts StdioOptions) (*StdioClient, error) 
 	}
 
 	// Parse hello_response to get runtime info
-	var hr struct {
-		Type            string `json:"type"`
-		AgentID         string `json:"agent_id"`
-		AgentName       string `json:"agent_name"`
-		ConversationID  string `json:"conversation_id"`
-		Model           string `json:"model"`
-		LettaCodeVersion string `json:"letta_code_version"`
-	}
-	json.Unmarshal(f.Raw, &hr)
-
-	c.Runtime = protocol.RuntimeScope{
-		AgentID:        hr.AgentID,
-		ConversationID: hr.ConversationID,
-	}
-
-	// Consume device_status frame (it arrives right after hello_response)
-	// Non-blocking — it'll come through the Frames channel if no pending request
-	go func() {
-		select {
-		case <-time.After(100 * time.Millisecond):
-		case <-ctx.Done():
-			return
+	if f.HelloResponse != nil {
+		c.Runtime = protocol.RuntimeScope{
+			AgentID:        f.HelloResponse.AgentID,
+			ConversationID: f.HelloResponse.ConversationID,
 		}
-	}()
+	}
 
 	return c, nil
 }
@@ -163,10 +145,11 @@ func (c *StdioClient) readLoop() {
 		if err != nil {
 			continue
 		}
+		// Correlated response: deliver to pending request channel
 		if frame.RequestID != "" {
 			c.mu.Lock()
 			ch, ok := c.pending[frame.RequestID]
-			if ok && frame.Type != "control_request" {
+			if ok {
 				delete(c.pending, frame.RequestID)
 				c.mu.Unlock()
 				select {
@@ -177,6 +160,7 @@ func (c *StdioClient) readLoop() {
 			}
 			c.mu.Unlock()
 		}
+		// Uncorrelated push frame: deliver to UI
 		select {
 		case c.Frames <- frame:
 		default:
@@ -192,12 +176,11 @@ func (c *StdioClient) sendRaw(v any) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return fmt.Errorf("stdio: client closed")
+	}
 	_, err = c.stdin.Write(append(raw, '\n'))
 	return err
-}
-
-func (c *StdioClient) send(v any) error {
-	return c.sendRaw(v)
 }
 
 func (c *StdioClient) request(ctx context.Context, requestID string, v any) (protocol.Frame, error) {
@@ -212,7 +195,7 @@ func (c *StdioClient) request(ctx context.Context, requestID string, v any) (pro
 	}()
 
 	if v != nil {
-		if err := c.send(v); err != nil {
+		if err := c.sendRaw(v); err != nil {
 			return protocol.Frame{}, err
 		}
 	}
@@ -232,17 +215,34 @@ func (c *StdioClient) nextRequestID() string {
 	return fmt.Sprintf("zc-%d", c.reqSeq)
 }
 
-// SendMessage sends an input_submit frame to the server.
+// debugLogFrame writes raw frame bytes to a debug file if ZC_DEBUG_FRAMES is set.
+func debugLogFrame(raw []byte) {
+	path := os.Getenv("ZC_DEBUG_FRAMES")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.Write(raw)
+	f.Write([]byte("\n"))
+}
+
+// ── Public API (thin-client methods) ──
+
+// SendMessage sends an input_submit frame (user message or slash command).
 func (c *StdioClient) SendMessage(content string) error {
-	return c.send(map[string]any{
+	return c.sendRaw(map[string]any{
 		"type":    "input_submit",
 		"content": content,
 	})
 }
 
-// SendInterrupt sends a control_request interrupt to abort the current turn.
+// SendInterrupt sends a control_request to abort the current turn.
 func (c *StdioClient) SendInterrupt() error {
-	return c.send(map[string]any{
+	return c.sendRaw(map[string]any{
 		"type":       "control_request",
 		"request_id": c.nextRequestID(),
 		"request":    map[string]any{"subtype": "interrupt"},
@@ -252,8 +252,8 @@ func (c *StdioClient) SendInterrupt() error {
 // SendApprovalResponse sends a control_response for a can_use_tool request.
 func (c *StdioClient) SendApprovalResponse(requestID, behavior string, updatedInput map[string]any) error {
 	resp := map[string]any{
-		"type":       "control_response",
-		"response":   map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
 			"subtype":    "success",
 			"request_id": requestID,
 		},
@@ -270,7 +270,36 @@ func (c *StdioClient) SendApprovalResponse(requestID, behavior string, updatedIn
 			"message":  "Denied by user",
 		}
 	}
-	return c.send(resp)
+	return c.sendRaw(resp)
+}
+
+// ExecuteCommand sends an execute_command frame.
+func (c *StdioClient) ExecuteCommand(commandID, args string) error {
+	m := map[string]any{
+		"type":       "execute_command",
+		"command_id": commandID,
+		"request_id": c.nextRequestID(),
+	}
+	if args != "" {
+		m["args"] = args
+	}
+	return c.sendRaw(m)
+}
+
+// ChangeMode sends a change_device_state frame with a new permission mode.
+func (c *StdioClient) ChangeMode(mode protocol.PermissionMode) error {
+	return c.sendRaw(map[string]any{
+		"type": "change_device_state",
+		"mode": string(mode),
+	})
+}
+
+// ChangeCWD sends a change_device_state frame with a new working directory.
+func (c *StdioClient) ChangeCWD(path string) error {
+	return c.sendRaw(map[string]any{
+		"type": "change_device_state",
+		"cwd":  path,
+	})
 }
 
 // QueryPanels sends a mod_panels_query and returns the response.
@@ -290,6 +319,237 @@ func (c *StdioClient) QueryPanels(ctx context.Context, width int) (json.RawMessa
 	return f.Raw, nil
 }
 
+// ListAgents sends an agents_list query and returns the response.
+func (c *StdioClient) ListAgents(ctx context.Context) ([]protocol.AgentSummary, error) {
+	reqID := c.nextRequestID()
+	q := map[string]any{
+		"type":       "agents_list",
+		"request_id": reqID,
+		"limit":      200,
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, reqID, q)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Agents []protocol.AgentSummary `json:"agents"`
+		Error  string                  `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	if resp.Error != "" {
+		return nil, fmt.Errorf("agents_list: %s", resp.Error)
+	}
+	return resp.Agents, nil
+}
+
+// ListConversations sends a conversations_list query.
+func (c *StdioClient) ListConversations(ctx context.Context, agentID string) ([]protocol.ConversationSummary, error) {
+	reqID := c.nextRequestID()
+	q := map[string]any{
+		"type":       "conversations_list",
+		"request_id": reqID,
+		"agent_id":   agentID,
+		"limit":      200,
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, reqID, q)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Conversations []protocol.ConversationSummary `json:"conversations"`
+		Error         string                         `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	if resp.Error != "" {
+		return nil, fmt.Errorf("conversations_list: %s", resp.Error)
+	}
+	return resp.Conversations, nil
+}
+
+// ListModels sends a models_list query and returns the catalog text.
+func (c *StdioClient) ListModels(ctx context.Context) (string, error) {
+	reqID := c.nextRequestID()
+	q := map[string]any{
+		"type":       "models_list",
+		"request_id": reqID,
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, reqID, q)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Models string `json:"models"`
+		Error  string `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	return resp.Models, nil
+}
+
+// UpdateModel sends an update_model frame.
+func (c *StdioClient) UpdateModel(ctx context.Context, modelID, modelHandle string) error {
+	reqID := c.nextRequestID()
+	m := map[string]any{
+		"type":       "update_model",
+		"request_id": reqID,
+	}
+	if modelID != "" {
+		m["model_id"] = modelID
+	}
+	if modelHandle != "" {
+		m["model_handle"] = modelHandle
+	}
+	updCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	f, err := c.request(updCtx, reqID, m)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	if !resp.Success && resp.Error != "" {
+		return fmt.Errorf("update_model: %s", resp.Error)
+	}
+	return nil
+}
+
+// ListMessages sends a conversation_messages_list query.
+func (c *StdioClient) ListMessages(ctx context.Context) ([]protocol.Delta, error) {
+	reqID := c.nextRequestID()
+	q := map[string]any{
+		"type":            "conversation_messages_list",
+		"request_id":      reqID,
+		"conversation_id": c.Runtime.ConversationID,
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, reqID, q)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Messages []protocol.Delta `json:"messages"`
+		Error    string           `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	return resp.Messages, nil
+}
+
+// Fork sends a conversation_fork request and returns the new conversation id.
+func (c *StdioClient) Fork(ctx context.Context) (string, error) {
+	reqID := c.nextRequestID()
+	q := map[string]any{
+		"type":       "conversation_fork",
+		"request_id": reqID,
+	}
+	forkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	f, err := c.request(forkCtx, reqID, q)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Success        bool   `json:"success"`
+		ConversationID string `json:"conversation_id"`
+		Error          string `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	if !resp.Success {
+		return "", fmt.Errorf("fork: %s", resp.Error)
+	}
+	return resp.ConversationID, nil
+}
+
+// UpdateConversation sends a conversation_update frame.
+func (c *StdioClient) UpdateConversation(ctx context.Context, body map[string]any) error {
+	reqID := c.nextRequestID()
+	m := map[string]any{
+		"type":            "conversation_update",
+		"request_id":      reqID,
+		"conversation_id": c.Runtime.ConversationID,
+	}
+	for k, v := range body {
+		m[k] = v
+	}
+	updCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	f, err := c.request(updCtx, reqID, m)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	if !resp.Success && resp.Error != "" {
+		return fmt.Errorf("conversation_update: %s", resp.Error)
+	}
+	return nil
+}
+
+// UpdateAgent sends an agent_update frame.
+func (c *StdioClient) UpdateAgent(ctx context.Context, body map[string]any) error {
+	reqID := c.nextRequestID()
+	m := map[string]any{
+		"type":       "agent_update",
+		"request_id": reqID,
+		"updates":    body,
+	}
+	updCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	f, err := c.request(updCtx, reqID, m)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	if !resp.Success && resp.Error != "" {
+		return fmt.Errorf("agent_update: %s", resp.Error)
+	}
+	return nil
+}
+
+// AgentRetrieve sends an agent_retrieve query.
+func (c *StdioClient) AgentRetrieve(ctx context.Context) (name, model string, err error) {
+	reqID := c.nextRequestID()
+	q := map[string]any{
+		"type":       "agent_retrieve",
+		"request_id": reqID,
+	}
+	retCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	f, err := c.request(retCtx, reqID, q)
+	if err != nil {
+		return "", "", err
+	}
+	var resp struct {
+		Agent struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"agent"`
+		Error string `json:"error"`
+	}
+	json.Unmarshal(f.Raw, &resp)
+	if resp.Error != "" {
+		return "", "", fmt.Errorf("agent_retrieve: %s", resp.Error)
+	}
+	return resp.Agent.Name, resp.Agent.Model, nil
+}
+
+// ── Lifecycle ──
+
 // Close kills the spawned process and cleans up.
 func (c *StdioClient) Close() {
 	c.mu.Lock()
@@ -300,6 +560,9 @@ func (c *StdioClient) Close() {
 	c.closed = true
 	c.mu.Unlock()
 
+	if c.stdin != nil {
+		c.stdin.Close()
+	}
 	if c.cmd != nil && c.cmd.Process != nil {
 		c.cmd.Process.Kill()
 		c.cmd.Wait()
@@ -314,4 +577,16 @@ func (c *StdioClient) SetMode(mode protocol.PermissionMode) {
 // SetConversation sets the conversation ID (stored for future use).
 func (c *StdioClient) SetConversation(conversationID string) {
 	c.opts.ConversationID = conversationID
+}
+
+// GetOpts returns the current options (for reconnect with new agent/conv).
+func (c *StdioClient) GetOpts() StdioOptions {
+	return c.opts
+}
+
+// IsClosed reports whether the client has been closed.
+func (c *StdioClient) IsClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }

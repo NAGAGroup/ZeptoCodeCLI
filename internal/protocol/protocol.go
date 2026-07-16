@@ -308,7 +308,7 @@ type Ack struct {
 	Conversation *ConversationSummary `json:"conversation"`
 }
 
-// ── Inbound frames (app-server → client) ──
+// ── Inbound frames (ui-server → client) ──
 
 // Frame is a decoded inbound frame. Exactly one typed field is non-nil;
 // Raw always holds the original JSON.
@@ -317,8 +317,23 @@ type Frame struct {
 	RequestID string
 	Raw       json.RawMessage
 
+	// ui-server push frames (not correlated to a client request)
+	HelloResponse    *HelloResponse
+	DeviceStatusFlat *DeviceStatusMessage
+	TurnStart        *TurnMessage
+	TurnEnd          *TurnMessage
+	TranscriptUpdate *TranscriptUpdateMessage
+	TranscriptSync   *TranscriptSyncMessage
+	CommandResult    *CommandResultMessage
+	BashOutput       *BashOutputMessage
+	ErrorMsg         *ErrorMessage
+	OverlayState     *OverlayStateMessage
+
+	// Shared (control_request is the same shape in both protocols)
+	ControlRequest *ControlRequest
+
+	// Legacy protocol_v2 fields (unused under ui-server, kept for reference)
 	RuntimeStartResponse *RuntimeStartResponse
-	ControlRequest       *ControlRequest
 	StreamDelta          *StreamDeltaMessage
 	LoopStatus           *LoopStatusUpdate
 	DeviceStatus         *DeviceStatusUpdate
@@ -329,6 +344,117 @@ type Frame struct {
 	SubagentUpdate       *SubagentUpdate
 	ListModels           *ListModelsResponse
 	UpdateModel          *UpdateModelResponse
+}
+
+// HelloResponse is the response to the hello handshake.
+type HelloResponse struct {
+	Type              string `json:"type"`
+	RequestID         string `json:"request_id"`
+	ProtocolVersion   int    `json:"protocol_version"`
+	RuntimeBuild      string `json:"runtime_build"`
+	LettaCodeVersion  string `json:"letta_code_version"`
+	AgentID           string `json:"agent_id"`
+	AgentName         string `json:"agent_name"`
+	ConversationID    string `json:"conversation_id"`
+	Model             string `json:"model"`
+}
+
+// DeviceStatusMessage is the flat device_status frame from the ui-server
+// (different from the nested update_device_status in protocol_v2).
+type DeviceStatusMessage struct {
+	Type              string           `json:"type"`
+	CWD               string           `json:"cwd"`
+	PermissionMode    PermissionMode   `json:"permission_mode"`
+	Model             string           `json:"model"`
+	AgentID           string           `json:"agent_id"`
+	AgentName         string           `json:"agent_name"`
+	ConversationID    string           `json:"conversation_id"`
+	Tools             []string         `json:"tools"`
+	LettaCodeVersion  string           `json:"letta_code_version"`
+}
+
+// TurnMessage covers both turn_start (no stop_reason) and turn_end.
+type TurnMessage struct {
+	Type       string `json:"type"`
+	StopReason string `json:"stop_reason,omitempty"`
+}
+
+// TranscriptUpdateMessage carries a streaming delta chunk.
+type TranscriptUpdateMessage struct {
+	Type   string `json:"type"`
+	Chunk  Delta  `json:"chunk"`
+}
+
+// TranscriptEntry is one entry in a transcript_sync.
+type TranscriptEntry struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"` // user, assistant, tool_call, tool_return, thinking, shell, event, error
+	Text string `json:"text"`
+	OTID string `json:"otid,omitempty"`
+}
+
+// TranscriptSyncMessage carries the accumulated entry model.
+type TranscriptSyncMessage struct {
+	Type    string            `json:"type"`
+	Entries []TranscriptEntry `json:"entries"`
+}
+
+// CommandResultMessage is the result of a slash command execution.
+type CommandResultMessage struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id,omitempty"`
+	Success   bool   `json:"success"`
+	Output    string `json:"output"`
+}
+
+// BashOutputMessage is the output of a bash-mode (!) command.
+type BashOutputMessage struct {
+	Type   string `json:"type"`
+	Output string `json:"output,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// ErrorMessage is a generic error frame.
+type ErrorMessage struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+// OverlayItem is a selectable item in an overlay descriptor.
+type OverlayItem struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Badge       string `json:"badge,omitempty"`
+	Disabled    bool   `json:"disabled,omitempty"`
+	Selected    bool   `json:"selected,omitempty"`
+}
+
+// OverlayField is a form field in an overlay descriptor.
+type OverlayField struct {
+	ID      string   `json:"id"`
+	Kind    string   `json:"kind"` // input, password, text, select, confirm
+	Label   string   `json:"label"`
+	Value   string   `json:"value,omitempty"`
+	Options []string `json:"options,omitempty"`
+}
+
+// OverlayDescriptor is the structured data for an interactive overlay.
+type OverlayDescriptor struct {
+	OverlayID   string         `json:"overlay_id"`
+	Kind        string         `json:"kind"` // select, multiselect, form, confirm, viewer, pager
+	Title       string         `json:"title"`
+	Items       []OverlayItem  `json:"items,omitempty"`
+	Fields      []OverlayField `json:"fields,omitempty"`
+	BodyFormat  string         `json:"body_format,omitempty"` // markdown, diff, plain
+	BodyContent string         `json:"body_content,omitempty"`
+	FooterHint  string         `json:"footer_hint,omitempty"`
+}
+
+// OverlayStateMessage is the push frame for overlay state.
+type OverlayStateMessage struct {
+	Type  string             `json:"type"`
+	Stack []OverlayDescriptor `json:"stack"`
 }
 
 type ConversationSummary struct {
@@ -567,12 +693,45 @@ func Decode(raw []byte) (Frame, error) {
 	f := Frame{Type: head.Type, RequestID: head.RequestID, Raw: append([]byte(nil), raw...)}
 	var err error
 	switch head.Type {
-	case "runtime_start_response":
-		f.RuntimeStartResponse = &RuntimeStartResponse{}
-		err = json.Unmarshal(raw, f.RuntimeStartResponse)
+	// ── ui-server frames ──
+	case "hello_response":
+		f.HelloResponse = &HelloResponse{}
+		err = json.Unmarshal(raw, f.HelloResponse)
+	case "device_status":
+		f.DeviceStatusFlat = &DeviceStatusMessage{}
+		err = json.Unmarshal(raw, f.DeviceStatusFlat)
+	case "turn_start":
+		f.TurnStart = &TurnMessage{}
+		err = json.Unmarshal(raw, f.TurnStart)
+	case "turn_end":
+		f.TurnEnd = &TurnMessage{}
+		err = json.Unmarshal(raw, f.TurnEnd)
+	case "transcript_update":
+		f.TranscriptUpdate = &TranscriptUpdateMessage{}
+		err = json.Unmarshal(raw, f.TranscriptUpdate)
+	case "transcript_sync":
+		f.TranscriptSync = &TranscriptSyncMessage{}
+		err = json.Unmarshal(raw, f.TranscriptSync)
 	case "control_request":
 		f.ControlRequest = &ControlRequest{}
 		err = json.Unmarshal(raw, f.ControlRequest)
+	case "command_result":
+		f.CommandResult = &CommandResultMessage{}
+		err = json.Unmarshal(raw, f.CommandResult)
+	case "bash_output":
+		f.BashOutput = &BashOutputMessage{}
+		err = json.Unmarshal(raw, f.BashOutput)
+	case "error":
+		f.ErrorMsg = &ErrorMessage{}
+		err = json.Unmarshal(raw, f.ErrorMsg)
+	case "overlay_state":
+		f.OverlayState = &OverlayStateMessage{}
+		err = json.Unmarshal(raw, f.OverlayState)
+
+	// ── Legacy protocol_v2 frames (kept for reference; unused under ui-server) ──
+	case "runtime_start_response":
+		f.RuntimeStartResponse = &RuntimeStartResponse{}
+		err = json.Unmarshal(raw, f.RuntimeStartResponse)
 	case "stream_delta":
 		f.StreamDelta = &StreamDeltaMessage{}
 		err = json.Unmarshal(raw, f.StreamDelta)
