@@ -6,3 +6,6 @@
 /zeptocode-cli
 /spike
 /zc
+
+# Machine-local Letta settings (permission grants etc.)
+.letta/
