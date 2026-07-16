@@ -255,7 +255,7 @@ Push frames are processed **reactively on arrival** — not via polling. The cli
 | `notification` | Emit terminal signal (bell/OSC) if client is unfocused; show toast |
 | `should_doctor` | Show doctor warning in statusline |
 
-**Periodic sync (client-implemented, not push):** for background job message visibility — `job_run` sends messages to the conversation via `sendMessageStream`, but an open TUI never refreshes its head. The client may periodically query `conversation_messages_list` (or a "messages since seq_id" query) to pick up these orphaned messages. The client decides the interval (e.g. every 5s); this is NOT a server push — it's a client-initiated periodic sync. This pattern is for cases where the server can't push (the message was sent outside the client's active turn) and the client needs to discover it.
+**Periodic sync (client-implemented, not push):** for background job message visibility — `job_run` sends messages to the conversation via `sendMessageStream`, but an open TUI never refreshes its head. The client periodically queries `conversation_messages_list` to pick up these orphaned messages. This is a full-history query (conversations are just JSON files — cheap on any modern hardware); the costly part is rendering, so the client diffs the queried history against its currently-rendered state and discards if no diff. The sync only runs when idle (no active turn, no overlay open) and not frequently — once every 15–30s is sufficient. This is NOT a server push — it's a client-initiated periodic sync for cases where the server can't push (the message was sent outside the client's active turn). No server-side "messages since seq_id" efficiency mode is needed.
 
 ### 5.5 Overlay frames (§5.5 — pickers, forms, viewers)
 
