@@ -55,8 +55,12 @@ type Client struct {
 
 	mu      sync.Mutex
 	pending map[string]chan protocol.Frame
-	reqSeq  int
-	closed  bool
+	// pendingStream entries receive EVERY frame with their request_id and
+	// are never auto-removed — for chunked responses (list_memory). The
+	// requester unregisters when done.
+	pendingStream map[string]chan protocol.Frame
+	reqSeq        int
+	closed        bool
 }
 
 // Start spawns the app-server, connects both channels, and starts the runtime.
@@ -90,9 +94,10 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 	}
 
 	c := &Client{
-		opts:    opts,
-		Frames:  make(chan protocol.Frame, 256),
-		pending: make(map[string]chan protocol.Frame),
+		opts:          opts,
+		Frames:        make(chan protocol.Frame, 256),
+		pending:       make(map[string]chan protocol.Frame),
+		pendingStream: make(map[string]chan protocol.Frame),
 	}
 
 	listen := fmt.Sprintf("ws://127.0.0.1:%d", opts.Port)
@@ -226,6 +231,12 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 		}
 		if frame.RequestID != "" {
 			c.mu.Lock()
+			if ch, ok := c.pendingStream[frame.RequestID]; ok && frame.Type != "control_request" {
+				// Chunked response: deliver every frame, keep the entry.
+				c.mu.Unlock()
+				ch <- frame
+				continue
+			}
 			ch, ok := c.pending[frame.RequestID]
 			if ok && frame.Type != "control_request" {
 				// control_request carries a request_id the SERVER wants
@@ -272,6 +283,26 @@ func (c *Client) request(ctx context.Context, requestID string, v any) (protocol
 	case <-ctx.Done():
 		return protocol.Frame{}, ctx.Err()
 	}
+}
+
+// requestStream sends a command whose response arrives as MULTIPLE frames
+// sharing the request_id (e.g. list_memory chunks). The returned channel
+// receives every matching frame until unregister is called.
+func (c *Client) requestStream(requestID string, v any) (<-chan protocol.Frame, func(), error) {
+	ch := make(chan protocol.Frame, 16)
+	c.mu.Lock()
+	c.pendingStream[requestID] = ch
+	c.mu.Unlock()
+	unregister := func() {
+		c.mu.Lock()
+		delete(c.pendingStream, requestID)
+		c.mu.Unlock()
+	}
+	if err := c.send(v); err != nil {
+		unregister()
+		return nil, nil, err
+	}
+	return ch, unregister, nil
 }
 
 func (c *Client) nextRequestID() string {

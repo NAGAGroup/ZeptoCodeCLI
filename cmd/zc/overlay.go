@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 type overlayKind int
@@ -23,6 +25,7 @@ const (
 	overlayJobs
 	overlayAgents
 	overlayModels
+	overlayMgmt // management overlays with a custom onSelect
 )
 
 type overlayItem struct {
@@ -37,6 +40,9 @@ type overlay struct {
 	items  []overlayItem
 	filter string
 	sel    int
+	// onSelect handles enter for overlayMgmt overlays (custom behavior per
+	// management command); nil for the built-in kinds.
+	onSelect func(m *model, it overlayItem) tea.Cmd
 }
 
 func (o *overlay) filtered() []overlayItem {

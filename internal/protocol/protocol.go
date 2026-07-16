@@ -469,6 +469,9 @@ type DeviceStatusUpdate struct {
 		SupportedCommands      []string                        `json:"supported_commands"`
 		ModCommands            []ModCommandInfo                `json:"mod_commands"`
 		PendingControlRequests []PendingControlRequestSnapshot `json:"pending_control_requests"`
+		// MemoryDirectory is the agent's MemFS root on this machine (null
+		// until memfs is enabled). Used by /skills to find agent skills.
+		MemoryDirectory string `json:"memory_directory"`
 	} `json:"device_status"`
 }
 

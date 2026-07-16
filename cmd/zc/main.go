@@ -42,6 +42,8 @@ const (
 	entryInfo
 	entryError
 	entryCommand // slash-command output block
+	entryDoc     // markdown document view (memory files)
+	entryDiff    // unified diff view (memory commit diffs)
 )
 
 type entry struct {
@@ -130,6 +132,8 @@ type model struct {
 	overlay        *overlay
 	completion     completionState
 	question       *questionForm // AskUserQuestion takes over the modal slot
+	mgmt           *mgmtForm     // management-command forms share that slot
+	memoryDir      string        // agent MemFS root (from device_status)
 	helpModel      help.Model
 	showHelp       bool
 	spin           spinner.Model
@@ -441,6 +445,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendEntry(&entry{kind: entryInfo, text: "reconnected (app-server respawned)"})
 		m.refreshViewport()
 		return m, waitForFrame(m.cli.Frames)
+
+	case mgmtMsg:
+		return m, m.applyMgmtMsg(msg)
 	}
 
 	// huh's internal messages (from Init/its own cmds) must reach the form.
@@ -450,6 +457,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.question.form = f
 		}
 		m.finishQuestionIfDone()
+		return m, cmd
+	}
+	if m.mgmt != nil {
+		form, cmd := m.mgmt.form.Update(msg)
+		if f, ok := form.(*huh.Form); ok {
+			m.mgmt.form = f
+		}
+		if done := m.finishMgmtIfDone(); done != nil {
+			return m, tea.Batch(cmd, done)
+		}
 		return m, cmd
 	}
 
@@ -564,6 +581,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.question.form = f
 		}
 		m.finishQuestionIfDone()
+		return m, cmd
+	}
+
+	// Management forms use the same modal slot; esc cancels harmlessly.
+	if m.mgmt != nil {
+		switch msg.String() {
+		case "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+		case "esc":
+			m.mgmt = nil
+			m.layout()
+			m.appendEntry(&entry{kind: entryInfo, text: "cancelled"})
+			m.refreshViewport()
+			return m, nil
+		}
+		form, cmd := m.mgmt.form.Update(msg)
+		if f, ok := form.(*huh.Form); ok {
+			m.mgmt.form = f
+		}
+		if done := m.finishMgmtIfDone(); done != nil {
+			return m, tea.Batch(cmd, done)
+		}
 		return m, cmd
 	}
 
@@ -994,6 +1034,16 @@ var clientCommands = []clientCommand{
 		m.appendEntry(&entry{kind: entryInfo, text: strings.TrimRight(b.String(), "\n")})
 		return nil
 	}},
+	{"secret", "manage agent secrets: /secret [list] | set KEY [VALUE] | unset KEY", cmdSecret},
+	{"skills", "list/enable/disable skills: /skills [list] | enable <path> | disable <name>", cmdSkills},
+	{"connect", "connect model providers: /connect [usage]", cmdConnect},
+	{"memory", "browse agent memory: /memory [list] | view|write|rm <path> | enable", cmdMemory},
+	{"memory-repository", "memory commit history: /memory-repository [file]", cmdMemoryRepository},
+	{"mods", "list mods, /mods reload applies changes", cmdMods},
+	{"hooks", "show configured hooks from all settings files", cmdHooks},
+	{"mcp", "MCP status (not wireable on local backend)", cmdMCP},
+	{"profiles", "agent profiles: /profiles [list] | save <name> | rm <name>", cmdProfiles},
+	{"crons", "cron tasks: /crons [list] | trigger <ref> | rm <ref>", cmdCrons},
 	{"help", "toggle keybinding help", func(m *model, _ string) tea.Cmd {
 		m.showHelp = !m.showHelp
 		m.layout()
@@ -1102,6 +1152,10 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.switchAgent(it.id)
 		case overlayModels:
 			return m, m.switchModel(protocol.UpdateModelPayload{ModelID: it.id})
+		case overlayMgmt:
+			if o.onSelect != nil {
+				return m, o.onSelect(m, it)
+			}
 		case overlayJobs:
 			// informational; nothing to launch
 		}
@@ -1233,6 +1287,9 @@ func (m *model) handleFrame(f protocol.Frame) {
 		}
 		if len(ds.ModCommands) > 0 {
 			m.modCmds = ds.ModCommands
+		}
+		if ds.MemoryDirectory != "" {
+			m.memoryDir = ds.MemoryDirectory
 		}
 		if ds.LettaCodeVersion != "" {
 			m.serverVersion = ds.LettaCodeVersion
@@ -1438,6 +1495,8 @@ func (m *model) extraHeight() int {
 	h := 2 // input border
 	if m.question != nil {
 		h += lipgloss.Height(m.renderQuestion())
+	} else if m.mgmt != nil {
+		h += lipgloss.Height(m.renderMgmtForm())
 	} else if m.overlay != nil {
 		h += lipgloss.Height(m.overlay.render(m.width, 14))
 	} else if len(m.approvals) > 0 {
@@ -1463,6 +1522,16 @@ func (m *model) renderQuestion() string {
 	title := styleAccent.Render("agent asks") + styleInfo.Render("  (esc dismisses = deny)")
 	return styleModal.BorderForeground(theme.Accent).Width(w).
 		Render(title + "\n\n" + m.question.form.View())
+}
+
+func (m *model) renderMgmtForm() string {
+	w := m.width - 4
+	if w < 20 {
+		w = 20
+	}
+	title := styleAccent.Render(m.mgmt.title) + styleInfo.Render("  (esc cancels)")
+	return styleModal.BorderForeground(theme.Accent).Width(w).
+		Render(title + "\n\n" + m.mgmt.form.View())
 }
 
 func (m *model) layout() {
@@ -1575,6 +1644,31 @@ func (m *model) renderEntry(e *entry, w int) string {
 		out = wrap.Render(line)
 	case entryCommand:
 		out = wrap.Render(styleAccent.Render("⌁ "+e.cmdInput) + "\n" + e.text)
+	case entryDoc:
+		md := ""
+		if r := m.markdownRenderer(w - 2); r != nil {
+			if rendered, err := r.Render(e.text); err == nil {
+				md = strings.Trim(rendered, "\n")
+			}
+		}
+		if md == "" {
+			md = e.text
+		}
+		out = styleAccent.Render("▤ "+e.cmdInput) + "\n" + md
+	case entryDiff:
+		var b strings.Builder
+		b.WriteString(styleAccent.Render("± "+e.cmdInput) + "\n")
+		for _, line := range strings.Split(strings.TrimRight(e.text, "\n"), "\n") {
+			switch {
+			case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+				b.WriteString(styleDiffAdd.Render(line) + "\n")
+			case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+				b.WriteString(styleDiffRemove.Render(line) + "\n")
+			default:
+				b.WriteString(styleDiffCtx.Render(line) + "\n")
+			}
+		}
+		out = wrap.Render(strings.TrimRight(b.String(), "\n"))
 	case entryInfo:
 		out = wrap.Render(styleInfo.Render(e.text))
 	case entryError:
@@ -1768,6 +1862,8 @@ func (m *model) View() string {
 	parts := []string{m.viewport.View()}
 	if m.question != nil {
 		parts = append(parts, m.renderQuestion())
+	} else if m.mgmt != nil {
+		parts = append(parts, m.renderMgmtForm())
 	} else if m.overlay != nil {
 		parts = append(parts, m.overlay.render(m.width, 14))
 	} else if len(m.approvals) > 0 {
