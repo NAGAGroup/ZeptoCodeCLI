@@ -77,9 +77,16 @@ func initTheme(isDark bool) {
 	styleModal = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Tool).Padding(0, 1)
 
-	styleDiffAdd = lipgloss.NewStyle().Foreground(theme.OK)
-	styleDiffRemove = lipgloss.NewStyle().Foreground(theme.Danger)
+	// Diff lines carry a subtle background tint (charmtone's diff ramps),
+	// like crush's diffview.
+	styleDiffAdd = lipgloss.NewStyle().Foreground(ld(charmtone.Guac, charmtone.Julep)).
+		Background(ld(lipgloss.Color("#e8f5e2"), charmtone.Spinach))
+	styleDiffRemove = lipgloss.NewStyle().Foreground(ld(charmtone.Sriracha, charmtone.Cherry)).
+		Background(ld(lipgloss.Color("#fbeaea"), charmtone.Toast))
 	styleDiffCtx = lipgloss.NewStyle().Foreground(theme.Dim)
+
+	styleModePill = lipgloss.NewStyle().Bold(true).Padding(0, 1).
+		Foreground(ld(charmtone.Salt, charmtone.Pepper))
 
 	styleOverlay = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(theme.Accent).Padding(0, 1)
 	styleOverlaySel = lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
@@ -136,6 +143,8 @@ var (
 	styleDiffAdd    lipgloss.Style
 	styleDiffRemove lipgloss.Style
 	styleDiffCtx    lipgloss.Style
+
+	styleModePill lipgloss.Style
 
 	styleOverlay      lipgloss.Style
 	styleOverlaySel   lipgloss.Style

@@ -182,7 +182,7 @@ func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) 
 	ta.ShowLineNumbers = false
 	ta.Focus()
 	sp := spinner.New()
-	sp.Spinner = spinner.Dot
+	sp.Spinner = spinner.MiniDot
 	sp.Style = lipgloss.NewStyle().Foreground(theme.Accent)
 	return &model{
 		cli:           cli,
@@ -1765,16 +1765,18 @@ func verbStatus(s string) string {
 func (m *model) statusline() string {
 	status := verbStatus(m.loopStatus)
 	if m.turnActive() {
-		status = m.spin.View() + " " + status
+		status = m.spin.View() + " " + styleAccent.Render(status)
+	} else {
+		status = styleInfo.Render(status)
 	}
 	if !m.connected {
-		status = styleError.Render("disconnected")
+		status = styleError.Render("✕ disconnected")
 	}
-	mode := styleStatusMode.Foreground(modeColor(m.mode)).Render(string(m.mode))
-	left := fmt.Sprintf(" %s · %s · %s · %s",
-		shortID(m.cli.Runtime.AgentID), m.cli.Runtime.ConversationID, mode, status)
+	pill := styleModePill.Background(modeColor(m.mode)).Render(string(m.mode))
+	ids := styleInfo.Render(fmt.Sprintf(" %s · %s ", shortID(m.cli.Runtime.AgentID), m.cli.Runtime.ConversationID))
+	left := pill + ids + status
 	if n := len(m.queue); n > 0 {
-		left += styleAccent.Render(fmt.Sprintf(" · ⧗%d", n))
+		left += styleAccent.Render(fmt.Sprintf(" · %s%d", iconQueue, n))
 	}
 	right := styleInfo.Render("^k cmds · ^p convs · ^j jobs · ^g help ")
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -1896,13 +1898,6 @@ func truncateLines(s string, maxLines, maxChars int) string {
 	return strings.Join(lines, "\n")
 }
 
-func indentLines(s, prefix string) string {
-	lines := strings.Split(s, "\n")
-	for i := range lines {
-		lines[i] = prefix + lines[i]
-	}
-	return strings.Join(lines, "\n")
-}
 
 // ── main ──
 
