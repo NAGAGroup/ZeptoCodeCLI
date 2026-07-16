@@ -42,6 +42,8 @@ func (m *model) activeDialog() string {
 	case m.mgmt != nil:
 		return dialogBox(m.mgmt.title, "esc cancels",
 			m.mgmt.form.View(w-4), w)
+	case m.pager != nil:
+		return m.pager.render(m.width, m.height)
 	case m.overlay != nil:
 		return m.overlay.render(w, 18)
 	case len(m.approvals) > 0:
@@ -55,8 +57,12 @@ func (m *model) activeDialog() string {
 // pass lives in lipgloss's Compositor).
 func compositeDialog(base, box string, termW, termH int) string {
 	bw, bh := lipgloss.Width(box), lipgloss.Height(box)
-	x := (termW - bw) / 2
-	y := (termH - bh) / 2
+	return compositeAt(base, box, (termW-bw)/2, (termH-bh)/2)
+}
+
+// compositeAt overlays box on base at a fixed position (floating popups
+// anchored to the input, e.g. completions).
+func compositeAt(base, box string, x, y int) string {
 	if x < 0 {
 		x = 0
 	}

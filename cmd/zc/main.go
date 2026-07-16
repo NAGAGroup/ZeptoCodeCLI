@@ -150,7 +150,10 @@ type model struct {
 	serverVersion  string
 	versionWarned  bool
 	serverCWD      string
-	modelHandle    string // set after /model switches; "" until then
+	modelHandle    string // current model handle (agent_retrieve / /model)
+	agentName      string // display name for the statusline
+	convTitle      string // conversation title for the statusline
+	pager          *pager // modal scrollable viewer (diffs, memory files)
 	lastUsage      protocol.Delta
 	sessionTokens  int64
 	ctrlCArmed     time.Time
@@ -290,6 +293,39 @@ func (m *model) connectCmd() tea.Cmd {
 	}
 }
 
+// startupConvPicker lists the picked agent's conversations so startup can
+// resume one directly (or begin fresh).
+func (m *model) startupConvPicker(agentID string) tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		convs, err := cli.ConversationsListFor(context.Background(), agentID)
+		if err != nil {
+			return connectDoneMsg{err: err}
+		}
+		items := []overlayItem{{id: "", title: "(new conversation)"}}
+		for _, c := range convs {
+			title := c.Title
+			if title == "" {
+				title = c.Summary
+			}
+			if title == "" {
+				title = c.ID
+			}
+			when := c.LastMessageAt
+			if when == "" {
+				when = c.UpdatedAt
+			}
+			items = append(items, overlayItem{id: c.ID, title: title, desc: c.ID + "  " + when})
+		}
+		ov := &overlay{kind: overlayMgmt, title: "choose a conversation", items: items}
+		ov.onSelect = func(m *model, it overlayItem) tea.Cmd {
+			m.startOpts.ConversationID = it.id
+			return m.startRuntimeCmd(agentID)
+		}
+		return mgmtMsg{overlay: ov}
+	}
+}
+
 // startRuntimeCmd starts the runtime for agent and fetches history if resuming.
 func (m *model) startRuntimeCmd(agent string) tea.Cmd {
 	cli := m.cli
@@ -343,7 +379,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.layout()
 		m.list.GotoBottom()
-		return m, waitForFrame(m.cli.Frames)
+		return m, tea.Batch(waitForFrame(m.cli.Frames), m.loadRuntimeInfo())
+
+	case runtimeInfoMsg:
+		if msg.agentName != "" {
+			m.agentName = msg.agentName
+		}
+		if msg.model != "" {
+			m.modelHandle = msg.model
+		}
+		m.convTitle = msg.convTitle
+		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -440,7 +486,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendEntry(&entry{kind: entryInfo, text: "switched to " + msg.conversationID})
 		m.refreshViewport()
 		m.list.GotoBottom()
-		return m, nil
+		return m, m.loadRuntimeInfo()
 
 	case disconnectedMsg:
 		m.connected = false
@@ -512,6 +558,33 @@ func (m *model) finishQuestionIfDone() {
 		m.appendEntry(&entry{kind: entryInfo, text: "answered: " + strings.Join(parts, " · ")})
 	}
 	m.refreshViewport()
+}
+
+type runtimeInfoMsg struct {
+	agentName string
+	model     string
+	convTitle string
+}
+
+// loadRuntimeInfo fetches display metadata for the statusline: agent name +
+// model handle (agent_retrieve) and conversation title.
+func (m *model) loadRuntimeInfo() tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		var out runtimeInfoMsg
+		if name, model, err := cli.AgentRetrieve(context.Background()); err == nil {
+			out.agentName, out.model = name, model
+		}
+		if convs, err := cli.ConversationsList(context.Background()); err == nil {
+			for _, c := range convs {
+				if c.ID == cli.Runtime.ConversationID {
+					out.convTitle = c.Title
+					break
+				}
+			}
+		}
+		return out
+	}
 }
 
 type reconnectedMsg struct {
@@ -614,6 +687,18 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmd, done)
 		}
 		return m, cmd
+	}
+
+	// Pager modal: scroll or dismiss.
+	if m.pager != nil {
+		if msg.String() == "ctrl+c" {
+			m.quitting = true
+			return m, tea.Quit
+		}
+		if !m.pager.handleKey(msg, m.height) {
+			m.pager = nil
+		}
+		return m, nil
 	}
 
 	// Overlays swallow keys next (user-invoked, so they take precedence).
@@ -967,6 +1052,7 @@ var clientCommands = []clientCommand{
 		if err := m.cli.UpdateConversation(context.Background(), map[string]any{"title": strings.TrimSpace(args)}); err != nil {
 			m.appendEntry(&entry{kind: entryError, text: err.Error()})
 		} else {
+			m.convTitle = strings.TrimSpace(args)
 			m.appendEntry(&entry{kind: entryInfo, text: "title set"})
 		}
 		return nil
@@ -1006,19 +1092,37 @@ var clientCommands = []clientCommand{
 	{"usage", "show session usage and runtime info", func(m *model, _ string) tea.Cmd {
 		model := m.modelHandle
 		if model == "" {
-			model = "(switch with /model to see handle)"
+			model = "(unknown)"
 		}
 		version := m.serverVersion
 		if version == "" {
 			version = "unknown"
 		}
-		usage := fmt.Sprintf("total=%d prompt=%d completion=%d steps=%d",
-			m.lastUsage.TotalTokens, m.lastUsage.PromptTokens,
-			m.lastUsage.CompletionTokens, m.lastUsage.StepCount)
-		m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf(
-			"agent: %s\nconversation: %s\nmodel: %s\nmode: %s\ncwd: %s\nletta-code: %s (zc tested %sx)\nlast-step usage: %s\nsession output tokens: %d",
-			m.cli.Runtime.AgentID, m.cli.Runtime.ConversationID, model, m.mode,
-			m.serverCWD, version, testedLettaCode, usage, m.sessionTokens)})
+		agent := m.agentName
+		if agent != "" {
+			agent += "  " + styleInfo.Render(m.cli.Runtime.AgentID)
+		} else {
+			agent = m.cli.Runtime.AgentID
+		}
+		conv := m.convTitle
+		if conv != "" {
+			conv += "  " + styleInfo.Render(m.cli.Runtime.ConversationID)
+		} else {
+			conv = m.cli.Runtime.ConversationID
+		}
+		body := kvBlock([][2]string{
+			{"agent", agent},
+			{"conversation", conv},
+			{"model", model},
+			{"mode", string(m.mode)},
+			{"cwd", m.serverCWD},
+			{"letta-code", fmt.Sprintf("%s (zc tested %sx)", version, testedLettaCode)},
+			{"last step", fmt.Sprintf("%d total · %d prompt · %d completion · %d steps",
+				m.lastUsage.TotalTokens, m.lastUsage.PromptTokens,
+				m.lastUsage.CompletionTokens, m.lastUsage.StepCount)},
+			{"session output", fmt.Sprintf("%d tokens", m.sessionTokens)},
+		})
+		m.appendEntry(&entry{kind: entryCommand, cmdInput: "/usage", text: body})
 		return nil
 	}},
 	{"export", "export transcript to a file: /export [path]", func(m *model, args string) tea.Cmd {
@@ -1175,8 +1279,8 @@ func (m *model) handleOverlayKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.refreshCompletions()
 		case overlayAgents:
 			if m.phase != phaseChat {
-				// startup picker: launch the chosen runtime
-				return m, m.startRuntimeCmd(it.id)
+				// startup: picked an agent — offer its conversations next
+				return m, m.startupConvPicker(it.id)
 			}
 			return m, m.switchAgent(it.id)
 		case overlayModels:
@@ -1541,9 +1645,6 @@ func (m *model) extraHeight() int {
 	if act := m.activityLines(); act != "" {
 		h += lipgloss.Height(act)
 	}
-	if m.completion.visible {
-		h += lipgloss.Height(m.renderCompletions())
-	}
 	if m.showHelp {
 		h += lipgloss.Height(m.helpModel.FullHelpView(keys.FullHelp()))
 	}
@@ -1773,8 +1874,21 @@ func (m *model) statusline() string {
 		status = styleError.Render("✕ disconnected")
 	}
 	pill := styleModePill.Background(modeColor(m.mode)).Render(string(m.mode))
-	ids := styleInfo.Render(fmt.Sprintf(" %s · %s ", shortID(m.cli.Runtime.AgentID), m.cli.Runtime.ConversationID))
-	left := pill + ids + status
+
+	agent := m.agentName
+	if agent == "" {
+		agent = shortID(m.cli.Runtime.AgentID)
+	}
+	conv := m.convTitle
+	if conv == "" {
+		conv = m.cli.Runtime.ConversationID
+	}
+	conv = compactOneLine(conv, 32)
+	left := pill + styleInfo.Render(fmt.Sprintf(" %s · %s ", agent, conv))
+	if model := shortModel(m.modelHandle); model != "" {
+		left += styleAccent.Render("◇ "+model) + " "
+	}
+	left += status
 	if n := len(m.queue); n > 0 {
 		left += styleAccent.Render(fmt.Sprintf(" · %s%d", iconQueue, n))
 	}
@@ -1784,6 +1898,14 @@ func (m *model) statusline() string {
 		return left
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// shortModel strips the provider prefix from a model handle for display.
+func shortModel(handle string) string {
+	if i := strings.LastIndex(handle, "/"); i >= 0 {
+		return handle[i+1:]
+	}
+	return handle
 }
 
 // activityLines renders queue + subagent status between transcript and input.
@@ -1854,11 +1976,11 @@ func (m *model) viewContent() string {
 		Width(m.width - 2).
 		Render(m.input.View())
 	parts = append(parts, inputBox)
-	if m.completion.visible {
-		parts = append(parts, m.renderCompletions())
-	}
+	helpH := 0
 	if m.showHelp {
-		parts = append(parts, m.helpModel.FullHelpView(keys.FullHelp()))
+		hv := m.helpModel.FullHelpView(keys.FullHelp())
+		parts = append(parts, hv)
+		helpH = lipgloss.Height(hv)
 	}
 	parts = append(parts, m.statusline())
 	base := strings.Join(parts, "\n")
@@ -1866,6 +1988,12 @@ func (m *model) viewContent() string {
 	// Dialogs float centered over everything (crush-style overlay).
 	if box := m.activeDialog(); box != "" {
 		return compositeDialog(base, box, m.width, m.height)
+	}
+	// Completions float anchored just above the input box.
+	if m.completion.visible {
+		box := styleOverlay.Render(m.renderCompletions())
+		y := m.height - 1 - helpH - lipgloss.Height(inputBox) - lipgloss.Height(box)
+		return compositeAt(base, box, 1, y)
 	}
 	return base
 }
@@ -1877,6 +2005,22 @@ func shortID(id string) string {
 		return id[:20] + "…"
 	}
 	return id
+}
+
+// kvBlock renders aligned key/value rows (accent keys, plain values) — the
+// house style for status-style command output.
+func kvBlock(rows [][2]string) string {
+	keyW := 0
+	for _, r := range rows {
+		if len(r[0]) > keyW {
+			keyW = len(r[0])
+		}
+	}
+	var b strings.Builder
+	for _, r := range rows {
+		b.WriteString(styleAccent.Render(fmt.Sprintf("%*s", keyW, r[0])) + "  " + r[1] + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func compactOneLine(s string, max int) string {

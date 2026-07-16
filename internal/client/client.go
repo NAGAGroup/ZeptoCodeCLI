@@ -372,14 +372,20 @@ func (c *Client) MessagesList(ctx context.Context) ([]protocol.Delta, error) {
 	return resp.Messages, nil
 }
 
-// ConversationsList fetches conversations for the current agent (the local
-// backend filters by agent_id and defaults to limit 20 — raise it).
+// ConversationsList fetches conversations for the current agent.
 func (c *Client) ConversationsList(ctx context.Context) ([]protocol.ConversationSummary, error) {
+	return c.ConversationsListFor(ctx, c.Runtime.AgentID)
+}
+
+// ConversationsListFor fetches conversations for any agent (usable before
+// runtime start — the startup conversation picker needs this). The local
+// backend defaults to limit 20 — raise it.
+func (c *Client) ConversationsListFor(ctx context.Context, agentID string) ([]protocol.ConversationSummary, error) {
 	cmd := protocol.ConversationListCommand{
 		Type:      "conversation_list",
 		RequestID: c.nextRequestID(),
 		Query: map[string]any{
-			"agent_id": c.Runtime.AgentID,
+			"agent_id": agentID,
 			"limit":    200,
 		},
 	}

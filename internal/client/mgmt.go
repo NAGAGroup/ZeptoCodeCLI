@@ -28,6 +28,29 @@ func (c *Client) mgmtRequest(ctx context.Context, requestID string, cmd any, out
 	return nil
 }
 
+// ── agent info ──
+
+// AgentRetrieve fetches the current agent's record: display name and model
+// handle (the statusline wants names, not ids).
+func (c *Client) AgentRetrieve(ctx context.Context) (name, model string, err error) {
+	cmd := protocol.AgentRetrieveCommand{Type: "agent_retrieve", RequestID: c.nextRequestID(), AgentID: c.Runtime.AgentID}
+	var resp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+		Agent   *struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"agent"`
+	}
+	if err := c.mgmtRequest(ctx, cmd.RequestID, cmd, &resp); err != nil {
+		return "", "", err
+	}
+	if !resp.Success || resp.Agent == nil {
+		return "", "", fmt.Errorf("agent_retrieve failed: %s", orUnknown(resp.Error))
+	}
+	return resp.Agent.Name, resp.Agent.Model, nil
+}
+
 // ── secrets ──
 
 // SecretList fetches secret entries (keys + plaintext values). Values are

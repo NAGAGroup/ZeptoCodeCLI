@@ -54,11 +54,20 @@ func (m *model) finishMgmtIfDone() tea.Cmd {
 // mgmtMsg is the generic async result for management operations.
 type mgmtMsg struct {
 	err     error
-	errWrap string       // prefix for err
-	entry   *entry       // append to transcript
-	overlay *overlay     // open an overlay
-	form    *mgmtForm    // open a form (Init dispatched by the handler)
-	infoTxt string       // append entryInfo
+	errWrap string    // prefix for err
+	entry   *entry    // append to transcript
+	overlay *overlay  // open an overlay
+	form    *mgmtForm // open a form (Init dispatched by the handler)
+	infoTxt string    // append entryInfo
+	// pagerView opens content in the modal pager instead of the transcript.
+	pagerView *pagerRequest
+}
+
+// pagerRequest describes modal content: kind selects the renderer.
+type pagerRequest struct {
+	title   string
+	content string
+	kind    string // "markdown" | "diff" | "plain"
 }
 
 func (m *model) applyMgmtMsg(msg mgmtMsg) tea.Cmd {
@@ -89,6 +98,21 @@ func (m *model) applyMgmtMsg(msg mgmtMsg) tea.Cmd {
 		m.mgmt = msg.form
 		m.layout()
 		return msg.form.form.Init()
+	}
+	if msg.pagerView != nil {
+		content := msg.pagerView.content
+		switch msg.pagerView.kind {
+		case "markdown":
+			if r := m.markdownRenderer(dialogWidth(m.width) - 6); r != nil {
+				if rendered, err := r.Render(content); err == nil {
+					content = strings.Trim(rendered, "\n")
+				}
+			}
+		case "diff":
+			content = diffColorize(content)
+		}
+		m.pager = newPager(msg.pagerView.title, content)
+		m.layout()
 	}
 	return nil
 }
@@ -630,9 +654,9 @@ func cmdMemory(m *model, args string) tea.Cmd {
 					m.refreshViewport()
 					return nil
 				}
-				m.appendEntry(&entry{kind: entryDoc, cmdInput: "memory: " + it.id, text: e.Content})
-				m.refreshViewport()
-				return nil
+				return func() tea.Msg {
+					return mgmtMsg{pagerView: &pagerRequest{title: "memory: " + it.id, content: e.Content, kind: "markdown"}}
+				}
 			}
 			return mgmtMsg{overlay: ov}
 		}
@@ -643,7 +667,7 @@ func cmdMemory(m *model, args string) tea.Cmd {
 			if err != nil {
 				return mgmtMsg{err: err, errWrap: "/memory view"}
 			}
-			return mgmtMsg{entry: &entry{kind: entryDoc, cmdInput: "memory: " + path, text: content}}
+			return mgmtMsg{pagerView: &pagerRequest{title: "memory: " + path, content: content, kind: "markdown"}}
 		}
 	case fields[0] == "write" && len(fields) == 2:
 		path := fields[1]
@@ -745,7 +769,7 @@ func cmdMemoryRepository(m *model, args string) tea.Cmd {
 				if len(sha) > 7 {
 					sha = sha[:7]
 				}
-				return mgmtMsg{entry: &entry{kind: entryDiff, cmdInput: "memory diff " + sha, text: diff}}
+				return mgmtMsg{pagerView: &pagerRequest{title: "memory diff " + sha, content: diff, kind: "diff"}}
 			}
 		}
 		return mgmtMsg{overlay: ov}

@@ -5,6 +5,14 @@
 // response types (the client unmarshals Frame.Raw directly).
 package protocol
 
+// ── agent info ──
+
+type AgentRetrieveCommand struct {
+	Type      string `json:"type"` // "agent_retrieve"
+	RequestID string `json:"request_id"`
+	AgentID   string `json:"agent_id"`
+}
+
 // ── secrets ──
 
 type SecretListCommand struct {
