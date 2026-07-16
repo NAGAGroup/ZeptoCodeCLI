@@ -97,10 +97,10 @@ func NewUserMessage(rt RuntimeScope, text string) InputCreateMessage {
 // ApprovalDecision is either allow (optional updated input / persisted
 // permission suggestions) or deny (message required by the protocol).
 type ApprovalDecision struct {
-	Behavior                         string         `json:"behavior"` // "allow" | "deny"
-	Message                          string         `json:"message,omitempty"`
-	UpdatedInput                     map[string]any `json:"updated_input,omitempty"`
-	SelectedPermissionSuggestionIDs  []string       `json:"selected_permission_suggestion_ids,omitempty"`
+	Behavior                        string         `json:"behavior"` // "allow" | "deny"
+	Message                         string         `json:"message,omitempty"`
+	UpdatedInput                    map[string]any `json:"updated_input,omitempty"`
+	SelectedPermissionSuggestionIDs []string       `json:"selected_permission_suggestion_ids,omitempty"`
 }
 
 type InputApprovalResponse struct {
@@ -127,6 +127,11 @@ type AbortMessageCommand struct {
 	RequestID string       `json:"request_id,omitempty"`
 }
 
+type AgentListCommand struct {
+	Type      string `json:"type"` // "agent_list"
+	RequestID string `json:"request_id"`
+}
+
 // ── Inbound frames (app-server → client) ──
 
 // Frame is a decoded inbound frame. Exactly one typed field is non-nil;
@@ -141,6 +146,18 @@ type Frame struct {
 	StreamDelta          *StreamDeltaMessage
 	LoopStatus           *LoopStatusUpdate
 	DeviceStatus         *DeviceStatusUpdate
+	AgentList            *AgentListResponse
+}
+
+type AgentSummary struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type AgentListResponse struct {
+	Success bool           `json:"success"`
+	Error   string         `json:"error"`
+	Agents  []AgentSummary `json:"agents"`
 }
 
 type RuntimeStartResponse struct {
@@ -213,12 +230,19 @@ type LoopStatusUpdate struct {
 	LoopStatus LoopState    `json:"loop_status"`
 }
 
+type PendingControlRequestSnapshot struct {
+	RequestID string             `json:"request_id"`
+	Request   ControlRequestBody `json:"request"`
+}
+
 type DeviceStatusUpdate struct {
 	Runtime      RuntimeScope `json:"runtime"`
 	DeviceStatus struct {
-		ConnectionName string         `json:"connection_name"`
-		Mode           PermissionMode `json:"mode"`
-		CWD            string         `json:"cwd"`
+		ConnectionName         string                          `json:"connection_name"`
+		Mode                   PermissionMode                  `json:"current_permission_mode"`
+		CWD                    string                          `json:"current_working_directory"`
+		IsProcessing           bool                            `json:"is_processing"`
+		PendingControlRequests []PendingControlRequestSnapshot `json:"pending_control_requests"`
 	} `json:"device_status"`
 }
 
@@ -250,6 +274,9 @@ func Decode(raw []byte) (Frame, error) {
 	case "update_device_status":
 		f.DeviceStatus = &DeviceStatusUpdate{}
 		err = json.Unmarshal(raw, f.DeviceStatus)
+	case "agent_list_response":
+		f.AgentList = &AgentListResponse{}
+		err = json.Unmarshal(raw, f.AgentList)
 	}
 	return f, err
 }

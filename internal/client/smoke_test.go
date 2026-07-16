@@ -23,7 +23,7 @@ func TestSmoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	cli, err := Start(ctx, Options{AgentID: agentID, Port: 8494})
+	cli, err := Start(ctx, Options{Agent: agentID, Port: 8494})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

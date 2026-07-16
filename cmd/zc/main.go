@@ -15,9 +15,9 @@ import (
 	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/NAGAGroup/ZeptoCodeCLI/internal/client"
@@ -65,23 +65,23 @@ func waitForFrame(frames <-chan protocol.Frame) tea.Cmd {
 // ── styles ──
 
 var (
-	styleUser      = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
-	styleAgent     = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	styleReasoning = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
-	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	styleToolOK    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	styleToolErr   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	styleInfo      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	styleStatus    = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("6")).Padding(0, 1)
+	styleUser       = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	styleAgent      = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	styleReasoning  = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
+	styleTool       = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	styleToolOK     = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	styleToolErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleInfo       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleError      = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	styleStatus     = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("6")).Padding(0, 1)
 	styleStatusBusy = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("3")).Padding(0, 1)
-	styleModal     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("11")).Padding(0, 1)
+	styleModal      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("11")).Padding(0, 1)
 )
 
 // ── model ──
 
 type model struct {
-	cli    *client.Client
+	cli     *client.Client
 	logPath string
 
 	viewport viewport.Model
@@ -117,7 +117,7 @@ func newModel(cli *client.Client, logPath string) *model {
 		input:        ta,
 		toolByCallID: map[string]*entry{},
 		loopStatus:   protocol.LoopWaitingOnInput,
-		mode:         protocol.ModeStandard,
+		mode:         "?", // real mode arrives via update_device_status
 		connected:    true,
 	}
 }
@@ -503,14 +503,14 @@ func compactOneLine(s string, max int) string {
 // ── main ──
 
 func main() {
-	agentID := flag.String("agent", "", "agent id (required)")
+	agentID := flag.String("agent", "", "agent id or name (required)")
 	conversationID := flag.String("conversation", "", "conversation id to resume (default: create new)")
 	port := flag.Int("port", 8493, "loopback port for the spawned app-server")
 	mode := flag.String("mode", "", "permission mode: standard | acceptEdits | unrestricted (default: server default)")
 	flag.Parse()
 
 	if *agentID == "" {
-		fmt.Fprintln(os.Stderr, "usage: zc --agent <agent-id> [--conversation <id>]")
+		fmt.Fprintln(os.Stderr, "usage: zc --agent <agent-id-or-name> [--conversation <id>]")
 		os.Exit(2)
 	}
 
@@ -523,7 +523,7 @@ func main() {
 
 	fmt.Printf("starting app-server and runtime for %s…\n", *agentID)
 	cli, err := client.Start(context.Background(), client.Options{
-		AgentID:        *agentID,
+		Agent:          *agentID,
 		ConversationID: *conversationID,
 		Port:           *port,
 		Mode:           protocol.PermissionMode(*mode),

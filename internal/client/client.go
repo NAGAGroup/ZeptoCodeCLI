@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,8 +25,9 @@ import (
 )
 
 type Options struct {
-	// AgentID to start the runtime for. Required.
-	AgentID string
+	// Agent is the agent id OR agent name to start the runtime for. Required.
+	// Names are resolved via agent_list with a case-insensitive exact match.
+	Agent string
 	// ConversationID to resume; empty means create a fresh conversation.
 	ConversationID string
 	// Port for the spawned app-server (loopback ⇒ no auth needed).
@@ -59,8 +61,8 @@ type Client struct {
 
 // Start spawns the app-server, connects both channels, and starts the runtime.
 func Start(ctx context.Context, opts Options) (*Client, error) {
-	if opts.AgentID == "" {
-		return nil, fmt.Errorf("client: AgentID is required")
+	if opts.Agent == "" {
+		return nil, fmt.Errorf("client: Agent is required")
 	}
 	if opts.Port == 0 {
 		opts.Port = 8493
@@ -102,11 +104,69 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	go func() { defer wg.Done(); c.readLoop(c.stream) }()
 	go func() { wg.Wait(); close(c.Frames) }()
 
-	if err := c.runtimeStart(ctx); err != nil {
+	agentID := opts.Agent
+	if !looksLikeAgentID(agentID) {
+		resolved, err := c.resolveAgentName(ctx, agentID)
+		if err != nil {
+			c.Close()
+			return nil, err
+		}
+		agentID = resolved
+	}
+
+	if err := c.runtimeStart(ctx, agentID); err != nil {
 		c.Close()
 		return nil, err
 	}
 	return c, nil
+}
+
+// looksLikeAgentID reports whether s is an agent id rather than a name.
+// Local and cloud ids both start with "agent-".
+func looksLikeAgentID(s string) bool {
+	return strings.HasPrefix(s, "agent-")
+}
+
+// resolveAgentName resolves an agent name to its id via agent_list.
+// Matching is case-insensitive and exact; ambiguity is an error.
+func (c *Client) resolveAgentName(ctx context.Context, name string) (string, error) {
+	cmd := protocol.AgentListCommand{Type: "agent_list", RequestID: c.nextRequestID()}
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, cmd.RequestID, cmd)
+	if err != nil {
+		return "", fmt.Errorf("client: agent_list: %w", err)
+	}
+	resp := f.AgentList
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil && resp.Error != "" {
+			msg = resp.Error
+		}
+		return "", fmt.Errorf("client: agent_list failed: %s", msg)
+	}
+	var matches []protocol.AgentSummary
+	var names []string
+	for _, a := range resp.Agents {
+		names = append(names, a.Name)
+		if strings.EqualFold(a.Name, name) {
+			matches = append(matches, a)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0].ID, nil
+	case 0:
+		return "", fmt.Errorf("client: no agent named %q (available: %s)",
+			name, strings.Join(names, ", "))
+	default:
+		var ids []string
+		for _, m := range matches {
+			ids = append(ids, m.ID)
+		}
+		return "", fmt.Errorf("client: agent name %q is ambiguous, use an id: %s",
+			name, strings.Join(ids, ", "))
+	}
 }
 
 func dialRetry(ctx context.Context, url string) (*websocket.Conn, error) {
@@ -198,11 +258,11 @@ func (c *Client) nextRequestID() string {
 	return fmt.Sprintf("zc-%d", c.reqSeq)
 }
 
-func (c *Client) runtimeStart(ctx context.Context) error {
+func (c *Client) runtimeStart(ctx context.Context, agentID string) error {
 	cmd := protocol.RuntimeStartCommand{
 		Type:      "runtime_start",
 		RequestID: c.nextRequestID(),
-		AgentID:   c.opts.AgentID,
+		AgentID:   agentID,
 		Mode:      c.opts.Mode,
 		ClientInfo: &protocol.ClientInfo{
 			Name:    "zeptocode-cli",

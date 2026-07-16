@@ -23,7 +23,7 @@ func TestSmokeApproval(t *testing.T) {
 
 	// standard mode: letta-code's server default is "unrestricted", which
 	// auto-allows every tool and never emits can_use_tool.
-	cli, err := Start(ctx, Options{AgentID: agentID, Port: 8495, Mode: protocol.ModeStandard})
+	cli, err := Start(ctx, Options{Agent: agentID, Port: 8495, Mode: protocol.ModeStandard})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
