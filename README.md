@@ -9,14 +9,28 @@ commands (skill installs, provider setup, etc.) stay with the native `letta` CLI
 
 ## Status
 
-Milestone 2: daily-drivable chat client — markdown rendering (glamour),
-conversation resume with history replay, diff previews + "always allow"
-permission suggestions in the approval modal, approval recovery on resume,
-input history, `--agent` by name or id.
+Milestones 1–5 complete: a full-featured chat cockpit.
+
+- **Chat**: glamour markdown, streaming, collapsed reasoning (`ctrl+r`),
+  tool cards with output previews (`ctrl+o`), queue + subagent activity lines
+- **Approvals**: modal with diff previews, permission suggestions (number keys
+  allow + persist a rule), approval recovery on resume
+- **Navigation**: conversation picker/switcher (`ctrl+p`), history replay on
+  resume, agent picker when `--agent` omitted, `--agent` by name or id
+- **Commands**: slash-command palette (`ctrl+k`) exposing server built-ins and
+  mod commands (ZeptoCode's `/audit`, `/jobs`, …), `/cmd` dispatch with tab
+  completion, `@`-path tab completion
+- **Modes**: `shift+tab` cycles standard → acceptEdits → unrestricted live
+  (`change_device_state`), statusline always shows server truth
+- **Resilience**: app-server death detection with auto-respawn + conversation
+  resume; letta-code version drift warning at startup
+- **ZeptoCode integration**: native jobs/broker panel (`ctrl+j`) reading
+  `~/.letta/jobs` manifests and the broker `/status` endpoint
+- **Portability**: `GOOS=windows` cross-compiles (untested on a real Windows box)
 
 ```bash
-# The TUI: streaming transcript, input box, statusline, tool-approval modal
-pixi run zc -- --agent <agent-id> [--conversation <id>] [--mode standard]
+# The TUI (omit --agent for an interactive picker)
+pixi run zc -- [--agent <name-or-id>] [--conversation <id>] [--mode standard]
 
 # Protocol frame dumper (debugging)
 pixi run spike -- --agent <agent-id> [--message "..."]
@@ -25,9 +39,12 @@ pixi run spike -- --agent <agent-id> [--message "..."]
 ZC_SMOKE_AGENT=<agent-id> pixi run smoke
 ```
 
-Keys: `enter` send · `alt+enter` newline · `up`/`down` input history · `esc`
-abort turn · `a`/`d` approve/deny tool use · `1`–`9` approve + persist the
-matching permission suggestion · `pgup`/`pgdn` scroll · `ctrl+c` quit.
+Keys: `enter` send · `alt+enter` newline · `up`/`down` input history · `tab`
+complete `/commands` and `@paths` · `esc` clear input / abort turn ·
+`ctrl+k` command palette · `ctrl+p` conversations · `ctrl+j` jobs/broker ·
+`ctrl+r` reasoning · `ctrl+o` tool output · `shift+tab` permission mode ·
+`a`/`d` approve/deny · `1`–`9` approve + persist suggestion ·
+wheel/`pgup`/`pgdn` scroll · `ctrl+c` quit (double-press mid-turn).
 
 Note on approvals: letta-code's server default permission mode is
 `unrestricted`; pass `--mode standard` if you want interactive tool approvals.

@@ -64,6 +64,21 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	if opts.Agent == "" {
 		return nil, fmt.Errorf("client: Agent is required")
 	}
+	c, err := Connect(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.StartRuntime(ctx, opts.Agent); err != nil {
+		c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// Connect spawns the app-server and connects both channels without starting
+// a runtime — callers can list agents first (e.g. an interactive picker),
+// then call StartRuntime.
+func Connect(ctx context.Context, opts Options) (*Client, error) {
 	if opts.Port == 0 {
 		opts.Port = 8493
 	}
@@ -104,21 +119,40 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	go func() { defer wg.Done(); c.readLoop(c.stream) }()
 	go func() { wg.Wait(); close(c.Frames) }()
 
-	agentID := opts.Agent
+	return c, nil
+}
+
+// StartRuntime resolves agent (name or id) and starts the runtime for it.
+func (c *Client) StartRuntime(ctx context.Context, agent string) error {
+	agentID := agent
 	if !looksLikeAgentID(agentID) {
 		resolved, err := c.resolveAgentName(ctx, agentID)
 		if err != nil {
-			c.Close()
-			return nil, err
+			return err
 		}
 		agentID = resolved
 	}
+	return c.runtimeStart(ctx, agentID)
+}
 
-	if err := c.runtimeStart(ctx, agentID); err != nil {
-		c.Close()
-		return nil, err
+// ListAgents returns agents known to the server.
+func (c *Client) ListAgents(ctx context.Context) ([]protocol.AgentSummary, error) {
+	cmd := protocol.AgentListCommand{Type: "agent_list", RequestID: c.nextRequestID()}
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, cmd.RequestID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("client: agent_list: %w", err)
 	}
-	return c, nil
+	resp := f.AgentList
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil && resp.Error != "" {
+			msg = resp.Error
+		}
+		return nil, fmt.Errorf("client: agent_list failed: %s", msg)
+	}
+	return resp.Agents, nil
 }
 
 // looksLikeAgentID reports whether s is an agent id rather than a name.
@@ -130,24 +164,13 @@ func looksLikeAgentID(s string) bool {
 // resolveAgentName resolves an agent name to its id via agent_list.
 // Matching is case-insensitive and exact; ambiguity is an error.
 func (c *Client) resolveAgentName(ctx context.Context, name string) (string, error) {
-	cmd := protocol.AgentListCommand{Type: "agent_list", RequestID: c.nextRequestID()}
-	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	f, err := c.request(listCtx, cmd.RequestID, cmd)
+	agents, err := c.ListAgents(ctx)
 	if err != nil {
-		return "", fmt.Errorf("client: agent_list: %w", err)
-	}
-	resp := f.AgentList
-	if resp == nil || !resp.Success {
-		msg := "unknown error"
-		if resp != nil && resp.Error != "" {
-			msg = resp.Error
-		}
-		return "", fmt.Errorf("client: agent_list failed: %s", msg)
+		return "", err
 	}
 	var matches []protocol.AgentSummary
 	var names []string
-	for _, a := range resp.Agents {
+	for _, a := range agents {
 		names = append(names, a.Name)
 		if strings.EqualFold(a.Name, name) {
 			matches = append(matches, a)
@@ -315,6 +338,58 @@ func (c *Client) MessagesList(ctx context.Context) ([]protocol.Delta, error) {
 		return nil, fmt.Errorf("client: conversation_messages_list failed: %s", msg)
 	}
 	return resp.Messages, nil
+}
+
+// ConversationsList fetches conversations visible to the server.
+func (c *Client) ConversationsList(ctx context.Context) ([]protocol.ConversationSummary, error) {
+	cmd := protocol.ConversationListCommand{
+		Type:      "conversation_list",
+		RequestID: c.nextRequestID(),
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	f, err := c.request(listCtx, cmd.RequestID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("client: conversation_list: %w", err)
+	}
+	resp := f.ConversationList
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil && resp.Error != "" {
+			msg = resp.Error
+		}
+		return nil, fmt.Errorf("client: conversation_list failed: %s", msg)
+	}
+	return resp.Conversations, nil
+}
+
+// ExecuteCommand dispatches a slash command; output arrives as
+// command_start/command_end stream deltas.
+func (c *Client) ExecuteCommand(commandID, args string) error {
+	return c.send(protocol.ExecuteCommandCommand{
+		Type:      "execute_command",
+		CommandID: commandID,
+		RequestID: c.nextRequestID(),
+		Runtime:   c.Runtime,
+		Args:      args,
+	})
+}
+
+// ChangeMode switches the runtime's permission mode; confirmation arrives
+// via update_device_status.
+func (c *Client) ChangeMode(mode protocol.PermissionMode) error {
+	return c.send(protocol.ChangeDeviceStateCommand{
+		Type:    "change_device_state",
+		Runtime: c.Runtime,
+		Payload: protocol.ChangeDeviceStatePayload{Mode: mode},
+	})
+}
+
+// SwitchConversation restarts the runtime on a different conversation
+// (empty id ⇒ create a new conversation) and updates c.Runtime.
+func (c *Client) SwitchConversation(ctx context.Context, conversationID string) error {
+	c.opts.ConversationID = conversationID
+	return c.runtimeStart(ctx, c.Runtime.AgentID)
 }
 
 // SendUserMessage submits a user turn.

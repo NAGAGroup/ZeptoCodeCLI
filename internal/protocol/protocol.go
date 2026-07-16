@@ -139,6 +139,34 @@ type ConversationMessagesListCommand struct {
 	Query          map[string]any `json:"query,omitempty"`
 }
 
+type ConversationListCommand struct {
+	Type      string         `json:"type"` // "conversation_list"
+	RequestID string         `json:"request_id"`
+	Query     map[string]any `json:"query,omitempty"`
+}
+
+// ExecuteCommandCommand dispatches a slash command (built-in or mod-provided);
+// results arrive as command_start/command_end stream deltas correlated by
+// request_id.
+type ExecuteCommandCommand struct {
+	Type      string       `json:"type"` // "execute_command"
+	CommandID string       `json:"command_id"`
+	RequestID string       `json:"request_id"`
+	Runtime   RuntimeScope `json:"runtime"`
+	Args      string       `json:"args,omitempty"`
+}
+
+type ChangeDeviceStatePayload struct {
+	Mode PermissionMode `json:"mode,omitempty"`
+	CWD  string         `json:"cwd,omitempty"`
+}
+
+type ChangeDeviceStateCommand struct {
+	Type    string                   `json:"type"` // "change_device_state"
+	Runtime RuntimeScope             `json:"runtime"`
+	Payload ChangeDeviceStatePayload `json:"payload"`
+}
+
 // ── Inbound frames (app-server → client) ──
 
 // Frame is a decoded inbound frame. Exactly one typed field is non-nil;
@@ -155,6 +183,58 @@ type Frame struct {
 	DeviceStatus         *DeviceStatusUpdate
 	AgentList            *AgentListResponse
 	MessagesList         *ConversationMessagesListResponse
+	ConversationList     *ConversationListResponse
+	QueueUpdate          *QueueUpdate
+	SubagentUpdate       *SubagentUpdate
+}
+
+type ConversationSummary struct {
+	ID            string `json:"id"`
+	Title         string `json:"title"`
+	Summary       string `json:"summary"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	LastMessageAt string `json:"last_message_at"`
+}
+
+type ConversationListResponse struct {
+	Success       bool                  `json:"success"`
+	Error         string                `json:"error"`
+	Conversations []ConversationSummary `json:"conversations"`
+}
+
+type QueueItem struct {
+	ID         string          `json:"id"`
+	Kind       string          `json:"kind"`
+	Content    json.RawMessage `json:"content"` // string | content parts
+	EnqueuedAt string          `json:"enqueued_at"`
+}
+
+// ContentText renders queue content that may be a string or content parts.
+func (q *QueueItem) ContentText() string {
+	d := Delta{Content: q.Content}
+	return d.Text()
+}
+
+type QueueUpdate struct {
+	Runtime RuntimeScope `json:"runtime"`
+	Queue   []QueueItem  `json:"queue"`
+}
+
+type SubagentSnapshot struct {
+	SubagentID   string `json:"subagent_id"`
+	SubagentType string `json:"subagent_type"`
+	Description  string `json:"description"`
+	Status       string `json:"status"` // pending|running|completed|error
+	IsBackground bool   `json:"is_background"`
+	TotalTokens  int64  `json:"total_tokens"`
+	DurationMs   int64  `json:"duration_ms"`
+	Error        string `json:"error"`
+}
+
+type SubagentUpdate struct {
+	Runtime   RuntimeScope       `json:"runtime"`
+	Subagents []SubagentSnapshot `json:"subagents"`
 }
 
 type AgentSummary struct {
@@ -253,10 +333,26 @@ type Delta struct {
 	ToolArgs   string          `json:"tool_args"`
 
 	// command / slash command lifecycle + status / retry / loop_error
-	Input   string `json:"input"`
-	Output  string `json:"output"`
-	Message string `json:"message"`
-	Level   string `json:"level"`
+	CommandID    string `json:"command_id"`
+	Input        string `json:"input"`
+	Output       string `json:"output"`
+	Success      *bool  `json:"success"`
+	Preformatted bool   `json:"preformatted"`
+	DimOutput    bool   `json:"dim_output"`
+	Message      string `json:"message"`
+	Level        string `json:"level"`
+}
+
+// ToolReturnText renders the tool_return payload (string or structured).
+func (d *Delta) ToolReturnText() string {
+	if len(d.ToolReturn) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(d.ToolReturn, &s); err == nil {
+		return s
+	}
+	return string(d.ToolReturn)
 }
 
 type StreamDeltaMessage struct {
@@ -276,6 +372,12 @@ type PendingControlRequestSnapshot struct {
 	Request   ControlRequestBody `json:"request"`
 }
 
+type ModCommandInfo struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Args        string `json:"args"`
+}
+
 type DeviceStatusUpdate struct {
 	Runtime      RuntimeScope `json:"runtime"`
 	DeviceStatus struct {
@@ -283,6 +385,9 @@ type DeviceStatusUpdate struct {
 		Mode                   PermissionMode                  `json:"current_permission_mode"`
 		CWD                    string                          `json:"current_working_directory"`
 		IsProcessing           bool                            `json:"is_processing"`
+		LettaCodeVersion       string                          `json:"letta_code_version"`
+		SupportedCommands      []string                        `json:"supported_commands"`
+		ModCommands            []ModCommandInfo                `json:"mod_commands"`
 		PendingControlRequests []PendingControlRequestSnapshot `json:"pending_control_requests"`
 	} `json:"device_status"`
 }
@@ -321,6 +426,15 @@ func Decode(raw []byte) (Frame, error) {
 	case "conversation_messages_list_response":
 		f.MessagesList = &ConversationMessagesListResponse{}
 		err = json.Unmarshal(raw, f.MessagesList)
+	case "conversation_list_response":
+		f.ConversationList = &ConversationListResponse{}
+		err = json.Unmarshal(raw, f.ConversationList)
+	case "update_queue":
+		f.QueueUpdate = &QueueUpdate{}
+		err = json.Unmarshal(raw, f.QueueUpdate)
+	case "update_subagent_state":
+		f.SubagentUpdate = &SubagentUpdate{}
+		err = json.Unmarshal(raw, f.SubagentUpdate)
 	}
 	return f, err
 }

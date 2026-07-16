@@ -8,12 +8,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -36,6 +40,7 @@ const (
 	entryTool
 	entryInfo
 	entryError
+	entryCommand // slash-command output block
 )
 
 type entry struct {
@@ -46,6 +51,9 @@ type entry struct {
 	toolCallID string
 	toolArgs   strings.Builder
 	toolStatus string // "", "running", "success", "error", "denied", "allowed"
+	toolReturn string // trimmed tool output, shown when ctrl+o enabled
+	// command entries
+	cmdInput string
 	// render cache (assistant markdown is expensive)
 	cachedRender string
 	cachedWidth  int
@@ -86,8 +94,10 @@ var (
 // ── model ──
 
 type model struct {
-	cli     *client.Client
-	logPath string
+	cli       *client.Client
+	logPath   string
+	port      int
+	serverLog *os.File
 
 	viewport viewport.Model
 	input    textarea.Model
@@ -115,11 +125,30 @@ type model struct {
 	historyIdx int      // len(history) == "not navigating"
 
 	seenApprovals map[string]bool // control_request request_ids already queued
+
+	// milestone 3+ state
+	overlay        *overlay
+	showReasoning  bool // reasoning collapsed by default
+	showToolOutput bool // tool-return previews hidden by default
+	queue          []protocol.QueueItem
+	subagents      []protocol.SubagentSnapshot
+	supportedCmds  []string
+	modCmds        []protocol.ModCommandInfo
+	serverVersion  string
+	versionWarned  bool
+	serverCWD      string
+	ctrlCArmed     time.Time
+	reconnectTried bool
 }
 
-func newModel(cli *client.Client, logPath string) *model {
+// testedLettaCode is the letta-code minor-version prefix this client was
+// verified against. There is no wire version negotiation; drift gets a
+// visible warning instead of silent breakage.
+const testedLettaCode = "0.28."
+
+func newModel(cli *client.Client, logPath string, port int, serverLog *os.File) *model {
 	ta := textarea.New()
-	ta.Placeholder = "Message the agent (enter to send, alt+enter for newline, esc aborts turn)"
+	ta.Placeholder = "Message the agent · enter sends · / commands · ctrl+k palette · ctrl+p conversations"
 	ta.Prompt = "┃ "
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
@@ -127,6 +156,8 @@ func newModel(cli *client.Client, logPath string) *model {
 	return &model{
 		cli:           cli,
 		logPath:       logPath,
+		port:          port,
+		serverLog:     serverLog,
 		input:         ta,
 		toolByCallID:  map[string]*entry{},
 		loopStatus:    protocol.LoopWaitingOnInput,
@@ -199,20 +230,121 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, waitForFrame(m.cli.Frames)
 
+	case conversationsMsg:
+		if msg.err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "conversation list failed: " + msg.err.Error()})
+			m.refreshViewport()
+			return m, nil
+		}
+		m.overlay = &overlay{kind: overlayConversations, title: "conversations", items: msg.items}
+		m.layout()
+		return m, nil
+
+	case switchedMsg:
+		if msg.err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "switch failed: " + msg.err.Error()})
+			m.refreshViewport()
+			return m, nil
+		}
+		m.entries = nil
+		m.toolByCallID = map[string]*entry{}
+		m.approvals = nil
+		m.seenApprovals = map[string]bool{}
+		m.queue = nil
+		m.subagents = nil
+		m.closeStreaming()
+		if len(msg.history) > 0 {
+			m.replayHistory(msg.history)
+		}
+		m.appendEntry(&entry{kind: entryInfo, text: "switched to " + msg.conversationID})
+		m.refreshViewport()
+		m.viewport.GotoBottom()
+		return m, nil
+
 	case disconnectedMsg:
 		m.connected = false
-		m.appendEntry(&entry{kind: entryError, text: "connection to app-server lost"})
+		if !m.reconnectTried {
+			m.reconnectTried = true
+			m.appendEntry(&entry{kind: entryError, text: "connection to app-server lost — reconnecting…"})
+			m.refreshViewport()
+			return m, m.reconnect()
+		}
+		m.appendEntry(&entry{kind: entryError, text: "connection to app-server lost (press ctrl+c to exit)"})
 		m.refreshViewport()
 		return m, nil
+
+	case reconnectedMsg:
+		if msg.err != nil {
+			m.appendEntry(&entry{kind: entryError, text: "reconnect failed: " + msg.err.Error()})
+			m.refreshViewport()
+			return m, nil
+		}
+		m.cli = msg.cli
+		m.connected = true
+		m.reconnectTried = false
+		m.appendEntry(&entry{kind: entryInfo, text: "reconnected (app-server respawned)"})
+		m.refreshViewport()
+		return m, waitForFrame(m.cli.Frames)
 	}
 
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	m.autosizeInput()
 	return m, cmd
 }
 
+type reconnectedMsg struct {
+	cli *client.Client
+	err error
+}
+
+// reconnect respawns the app-server and resumes the same conversation.
+func (m *model) reconnect() tea.Cmd {
+	mode := m.mode
+	switch mode {
+	case protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted:
+	default:
+		mode = "" // unknown placeholder — let the server default
+	}
+	opts := client.Options{
+		Agent:          m.cli.Runtime.AgentID,
+		ConversationID: m.cli.Runtime.ConversationID,
+		Port:           m.port,
+		Mode:           mode,
+		ServerLog:      m.serverLog,
+	}
+	old := m.cli
+	return func() tea.Msg {
+		old.Close()
+		time.Sleep(1 * time.Second)
+		cli, err := client.Start(context.Background(), opts)
+		return reconnectedMsg{cli: cli, err: err}
+	}
+}
+
+// autosizeInput grows the textarea with its content (3–8 rows).
+func (m *model) autosizeInput() {
+	lines := strings.Count(m.input.Value(), "\n") + 1
+	h := lines + 1
+	if h < 3 {
+		h = 3
+	}
+	if h > 8 {
+		h = 8
+	}
+	if h != m.input.Height() {
+		m.input.SetHeight(h)
+		m.layout()
+	}
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Approval modal swallows keys first.
+	// Overlays swallow keys first (user-invoked, so they take precedence).
+	if m.overlay != nil {
+		return m.handleOverlayKey(msg)
+	}
+
+	// Approval modal next.
 	if len(m.approvals) > 0 {
 		req := m.approvals[0]
 		key := msg.String()
@@ -244,15 +376,52 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "ctrl+c":
+		// Double-press to quit while a turn is active; instant when idle.
+		if m.turnActive() && time.Since(m.ctrlCArmed) > 2*time.Second {
+			m.ctrlCArmed = time.Now()
+			m.appendEntry(&entry{kind: entryInfo, text: "turn is active — press ctrl+c again to quit"})
+			m.refreshViewport()
+			return m, nil
+		}
 		m.quitting = true
 		return m, tea.Quit
 	case "esc":
+		// Priority: clear non-empty input, else abort the active turn.
+		if strings.TrimSpace(m.input.Value()) != "" {
+			m.input.Reset()
+			m.historyIdx = len(m.history)
+			return m, nil
+		}
 		if m.turnActive() {
 			_ = m.cli.Abort()
 			m.appendEntry(&entry{kind: entryInfo, text: "⏹ abort requested"})
 			m.refreshViewport()
 		}
 		return m, nil
+	case "ctrl+p":
+		return m, m.openConversationPicker()
+	case "ctrl+k":
+		m.openCommandPalette()
+		return m, nil
+	case "ctrl+j":
+		m.overlay = &overlay{kind: overlayJobs, title: "ZeptoCode jobs + broker", items: jobsOverlayItems()}
+		m.layout()
+		return m, nil
+	case "ctrl+r":
+		m.showReasoning = !m.showReasoning
+		m.refreshViewport()
+		return m, nil
+	case "ctrl+o":
+		m.showToolOutput = !m.showToolOutput
+		m.refreshViewport()
+		return m, nil
+	case "shift+tab":
+		m.cycleMode()
+		return m, nil
+	case "tab":
+		if m.tryComplete() {
+			return m, nil
+		}
 	case "enter":
 		text := strings.TrimSpace(m.input.Value())
 		if text == "" {
@@ -261,6 +430,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.Reset()
 		m.history = append(m.history, text)
 		m.historyIdx = len(m.history)
+		if strings.HasPrefix(text, "/") {
+			m.dispatchSlashCommand(text)
+			return m, nil
+		}
 		m.closeStreaming()
 		m.appendEntry(&entry{kind: entryUser, text: text})
 		if err := m.cli.SendUserMessage(text); err != nil {
@@ -303,6 +476,237 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// ── overlays, palette, completion, mode ──
+
+type conversationsMsg struct {
+	items []overlayItem
+	err   error
+}
+
+func (m *model) openConversationPicker() tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		convs, err := cli.ConversationsList(context.Background())
+		if err != nil {
+			return conversationsMsg{err: err}
+		}
+		items := []overlayItem{{id: "", title: "(new conversation)"}}
+		for _, c := range convs {
+			title := c.Title
+			if title == "" {
+				title = c.Summary
+			}
+			if title == "" {
+				title = c.ID
+			}
+			when := c.LastMessageAt
+			if when == "" {
+				when = c.UpdatedAt
+			}
+			items = append(items, overlayItem{id: c.ID, title: title, desc: c.ID + "  " + when})
+		}
+		return conversationsMsg{items: items}
+	}
+}
+
+// knownCommands merges server built-ins and mod commands for the palette
+// and completion.
+func (m *model) knownCommands() []overlayItem {
+	var items []overlayItem
+	for _, c := range m.modCmds {
+		desc := c.Description
+		if c.Args != "" {
+			desc = c.Args + " — " + desc
+		}
+		items = append(items, overlayItem{id: c.ID, title: "/" + c.ID, desc: desc})
+	}
+	for _, c := range m.supportedCmds {
+		items = append(items, overlayItem{id: c, title: "/" + c, desc: "built-in"})
+	}
+	return items
+}
+
+func (m *model) openCommandPalette() {
+	m.overlay = &overlay{kind: overlayCommands, title: "slash commands", items: m.knownCommands()}
+	m.layout()
+}
+
+func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	o := m.overlay
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.overlay = nil
+		m.layout()
+		return m, nil
+	case "up", "ctrl+p":
+		o.sel--
+		o.clampSel()
+		return m, nil
+	case "down", "ctrl+n":
+		o.sel++
+		o.clampSel()
+		return m, nil
+	case "backspace":
+		if len(o.filter) > 0 {
+			o.filter = o.filter[:len(o.filter)-1]
+			o.clampSel()
+		}
+		return m, nil
+	case "enter":
+		items := o.filtered()
+		if len(items) == 0 {
+			return m, nil
+		}
+		it := items[o.sel]
+		kind := o.kind
+		m.overlay = nil
+		m.layout()
+		switch kind {
+		case overlayConversations:
+			return m, m.switchConversation(it.id)
+		case overlayCommands:
+			m.input.SetValue("/" + it.id + " ")
+			m.input.CursorEnd()
+			m.input.Focus()
+		case overlayJobs, overlayAgents:
+			// informational; nothing to launch
+		}
+		return m, nil
+	}
+	if msg.Type == tea.KeyRunes {
+		o.filter += string(msg.Runes)
+		o.clampSel()
+	}
+	return m, nil
+}
+
+type switchedMsg struct {
+	conversationID string
+	history        []protocol.Delta
+	err            error
+}
+
+func (m *model) switchConversation(conversationID string) tea.Cmd {
+	cli := m.cli
+	return func() tea.Msg {
+		if err := cli.SwitchConversation(context.Background(), conversationID); err != nil {
+			return switchedMsg{err: err}
+		}
+		var hist []protocol.Delta
+		if conversationID != "" {
+			hist, _ = cli.MessagesList(context.Background())
+		}
+		return switchedMsg{conversationID: cli.Runtime.ConversationID, history: hist}
+	}
+}
+
+func (m *model) cycleMode() {
+	order := []protocol.PermissionMode{protocol.ModeStandard, protocol.ModeAcceptEdits, protocol.ModeUnrestricted}
+	next := order[0]
+	for i, mo := range order {
+		if mo == m.mode {
+			next = order[(i+1)%len(order)]
+			break
+		}
+	}
+	if err := m.cli.ChangeMode(next); err != nil {
+		m.appendEntry(&entry{kind: entryError, text: "mode change failed: " + err.Error()})
+		m.refreshViewport()
+	}
+	// statusline updates when update_device_status confirms
+}
+
+// tryComplete implements tab completion: "/" prefixes complete against the
+// command palette, "@" tokens complete against the filesystem (server cwd).
+func (m *model) tryComplete() bool {
+	val := m.input.Value()
+	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
+		prefix := strings.ToLower(strings.TrimPrefix(val, "/"))
+		var matches []string
+		for _, c := range m.knownCommands() {
+			if strings.HasPrefix(strings.ToLower(c.id), prefix) {
+				matches = append(matches, c.id)
+			}
+		}
+		if len(matches) == 1 {
+			m.input.SetValue("/" + matches[0] + " ")
+			m.input.CursorEnd()
+			return true
+		}
+		if len(matches) > 1 {
+			m.appendEntry(&entry{kind: entryInfo, text: "matches: /" + strings.Join(matches, "  /")})
+			m.refreshViewport()
+			return true
+		}
+		return false
+	}
+	// @-file completion on the last whitespace-separated token.
+	fields := strings.Split(val, " ")
+	last := fields[len(fields)-1]
+	if !strings.HasPrefix(last, "@") {
+		return false
+	}
+	frag := strings.TrimPrefix(last, "@")
+	base := m.serverCWD
+	if base == "" {
+		base, _ = os.Getwd()
+	}
+	dir, partial := filepath.Split(frag)
+	list, err := os.ReadDir(filepath.Join(base, dir))
+	if err != nil {
+		return false
+	}
+	var matches []string
+	for _, de := range list {
+		if strings.HasPrefix(de.Name(), partial) {
+			name := de.Name()
+			if de.IsDir() {
+				name += "/"
+			}
+			matches = append(matches, name)
+		}
+	}
+	if len(matches) == 1 {
+		fields[len(fields)-1] = "@" + dir + matches[0]
+		m.input.SetValue(strings.Join(fields, " "))
+		m.input.CursorEnd()
+		return true
+	}
+	if len(matches) > 1 {
+		show := matches
+		if len(show) > 12 {
+			show = show[:12]
+		}
+		m.appendEntry(&entry{kind: entryInfo, text: "files: " + strings.Join(show, "  ")})
+		m.refreshViewport()
+		return true
+	}
+	return false
+}
+
+func (m *model) dispatchSlashCommand(text string) {
+	name := strings.TrimPrefix(strings.Fields(text)[0], "/")
+	args := strings.TrimSpace(strings.TrimPrefix(text, "/"+name))
+	known := false
+	for _, c := range m.knownCommands() {
+		if c.id == name {
+			known = true
+			break
+		}
+	}
+	if !known {
+		m.appendEntry(&entry{kind: entryError, text: "unknown command: /" + name + " (ctrl+k lists commands)"})
+		m.refreshViewport()
+		return
+	}
+	m.closeStreaming()
+	m.appendEntry(&entry{kind: entryUser, text: text})
+	if err := m.cli.ExecuteCommand(name, args); err != nil {
+		m.appendEntry(&entry{kind: entryError, text: "command failed: " + err.Error()})
+	}
+	m.refreshViewport()
+}
+
 func (m *model) resolveApproval(req *protocol.ControlRequest, decision protocol.ApprovalDecision) {
 	m.approvals = m.approvals[1:]
 	if err := m.cli.RespondApproval(req.RequestID, decision); err != nil {
@@ -334,6 +738,24 @@ func (m *model) handleFrame(f protocol.Frame) {
 		if ds.Mode != "" {
 			m.mode = ds.Mode
 		}
+		if ds.CWD != "" {
+			m.serverCWD = ds.CWD
+		}
+		if len(ds.SupportedCommands) > 0 {
+			m.supportedCmds = ds.SupportedCommands
+		}
+		if len(ds.ModCommands) > 0 {
+			m.modCmds = ds.ModCommands
+		}
+		if ds.LettaCodeVersion != "" {
+			m.serverVersion = ds.LettaCodeVersion
+			if !m.versionWarned && !strings.HasPrefix(ds.LettaCodeVersion, testedLettaCode) {
+				m.versionWarned = true
+				m.appendEntry(&entry{kind: entryInfo, text: fmt.Sprintf(
+					"⚠ letta-code %s differs from tested %sx — protocol drift possible (no wire versioning)",
+					ds.LettaCodeVersion, testedLettaCode)})
+			}
+		}
 		// Approval recovery: a resumed conversation may have approvals that
 		// were pending when the previous client went away.
 		for i := range ds.PendingControlRequests {
@@ -343,6 +765,12 @@ func (m *model) handleFrame(f protocol.Frame) {
 				Request:   p.Request,
 			})
 		}
+
+	case f.QueueUpdate != nil:
+		m.queue = f.QueueUpdate.Queue
+
+	case f.SubagentUpdate != nil:
+		m.subagents = f.SubagentUpdate.Subagents
 
 	case f.StreamDelta != nil:
 		m.handleDelta(&f.StreamDelta.Delta)
@@ -437,6 +865,9 @@ func (m *model) handleDelta(d *protocol.Delta) {
 			if e.toolStatus != "denied" {
 				e.toolStatus = d.Status
 			}
+			if ret := strings.TrimSpace(d.ToolReturnText()); ret != "" {
+				e.toolReturn = truncateLines(ret, 6, 400)
+			}
 		}
 
 	case "client_tool_start":
@@ -452,6 +883,19 @@ func (m *model) handleDelta(d *protocol.Delta) {
 		if e, ok := m.toolByCallID[d.ToolCallID]; ok && e.toolStatus != "denied" {
 			e.toolStatus = d.Status
 		}
+
+	case "command_start", "slash_command_start":
+		m.closeStreaming()
+		m.appendEntry(&entry{kind: entryInfo, text: "⌁ " + d.Input + " running…"})
+
+	case "command_end", "slash_command_end":
+		m.closeStreaming()
+		e := &entry{kind: entryCommand, cmdInput: d.Input, text: strings.TrimRight(d.Output, "\n")}
+		if d.Success != nil && !*d.Success {
+			e.kind = entryError
+			e.text = d.Input + " failed:\n" + e.text
+		}
+		m.appendEntry(e)
 
 	case "status":
 		m.appendEntry(&entry{kind: entryInfo, text: d.Message})
@@ -482,14 +926,27 @@ func (m *model) appendEntry(e *entry) {
 	m.entries = append(m.entries, e)
 }
 
+// extraHeight is everything between the viewport and the input: overlay or
+// approval modal, plus queue/subagent activity lines.
+func (m *model) extraHeight() int {
+	h := 0
+	if m.overlay != nil {
+		h += lipgloss.Height(m.overlay.render(m.width, 14))
+	} else if len(m.approvals) > 0 {
+		h += lipgloss.Height(m.renderModal())
+	}
+	if act := m.activityLines(); act != "" {
+		h += lipgloss.Height(act)
+	}
+	return h
+}
+
 func (m *model) layout() {
 	statusH := 1
 	inputH := m.input.Height() + 1
-	modalH := 0
-	if len(m.approvals) > 0 {
-		modalH = lipgloss.Height(m.renderModal())
-	}
-	vpH := m.height - statusH - inputH - modalH
+	extraH := m.extraHeight()
+	m.lastModalH = extraH
+	vpH := m.height - statusH - inputH - extraH
 	if vpH < 3 {
 		vpH = 3
 	}
@@ -513,16 +970,8 @@ func (m *model) refreshViewport() {
 	if atBottom {
 		m.viewport.GotoBottom()
 	}
-	// Modal height can change with queue state; keep geometry honest.
-	m.layoutIfModalChanged()
-}
-
-func (m *model) layoutIfModalChanged() {
-	h := 0
-	if len(m.approvals) > 0 {
-		h = lipgloss.Height(m.renderModal())
-	}
-	if h != m.lastModalH {
+	// Overlay/modal/activity heights change with state; keep geometry honest.
+	if h := m.extraHeight(); h != m.lastModalH {
 		m.lastModalH = h
 		statusH := 1
 		inputH := m.input.Height() + 1
@@ -590,9 +1039,20 @@ func (m *model) renderTranscript() string {
 		case entryAssistant:
 			b.WriteString(m.renderAssistant(e, w-2))
 		case entryReasoning:
-			b.WriteString(wrap.Render(styleReasoning.Render("· " + e.text)))
+			if m.showReasoning {
+				b.WriteString(wrap.Render(styleReasoning.Render("· " + e.text)))
+			} else {
+				b.WriteString(wrap.Render(styleReasoning.Render(fmt.Sprintf(
+					"· reasoning (%d chars — ctrl+r expands)", len(e.text)))))
+			}
 		case entryTool:
-			b.WriteString(wrap.Render(m.renderToolLine(e)))
+			line := m.renderToolLine(e)
+			if m.showToolOutput && e.toolReturn != "" {
+				line += "\n" + styleInfo.Render(indentLines(e.toolReturn, "  │ "))
+			}
+			b.WriteString(wrap.Render(line))
+		case entryCommand:
+			b.WriteString(wrap.Render(styleInfo.Render("⌁ "+e.cmdInput) + "\n" + e.text))
 		case entryInfo:
 			b.WriteString(wrap.Render(styleInfo.Render(e.text)))
 		case entryError:
@@ -699,8 +1159,35 @@ func (m *model) statusline() string {
 	}
 	left := fmt.Sprintf("%s · %s · %s",
 		shortID(m.cli.Runtime.AgentID), m.cli.Runtime.ConversationID, m.mode)
-	line := fmt.Sprintf("%s │ %s", left, status)
+	if n := len(m.queue); n > 0 {
+		left += fmt.Sprintf(" · q:%d", n)
+	}
+	line := fmt.Sprintf("%s │ %s │ ^k cmds ^p convs ^j jobs", left, status)
 	return style.Width(m.width).Render(line)
+}
+
+// activityLines renders queue + subagent status between transcript and input.
+func (m *model) activityLines() string {
+	var lines []string
+	if n := len(m.queue); n > 0 {
+		first := compactOneLine(m.queue[0].ContentText(), m.width-24)
+		lines = append(lines, styleInfo.Render(fmt.Sprintf("⧗ %d queued: %s", n, first)))
+	}
+	shown := 0
+	for i := range m.subagents {
+		s := &m.subagents[i]
+		if s.Status != "running" && s.Status != "pending" {
+			continue
+		}
+		if shown >= 3 {
+			lines = append(lines, styleInfo.Render("⚙ …more subagents running"))
+			break
+		}
+		lines = append(lines, styleInfo.Render(fmt.Sprintf("⚙ %s: %s (%s, %dk tok)",
+			s.SubagentType, compactOneLine(s.Description, m.width-40), s.Status, s.TotalTokens/1000)))
+		shown++
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *model) View() string {
@@ -711,8 +1198,13 @@ func (m *model) View() string {
 		return "connecting…"
 	}
 	parts := []string{m.viewport.View()}
-	if len(m.approvals) > 0 {
+	if m.overlay != nil {
+		parts = append(parts, m.overlay.render(m.width, 14))
+	} else if len(m.approvals) > 0 {
 		parts = append(parts, m.renderModal())
+	}
+	if act := m.activityLines(); act != "" {
+		parts = append(parts, act)
 	}
 	parts = append(parts, m.input.View(), m.statusline())
 	return strings.Join(parts, "\n")
@@ -735,7 +1227,52 @@ func compactOneLine(s string, max int) string {
 	return s
 }
 
+func truncateLines(s string, maxLines, maxChars int) string {
+	if len(s) > maxChars {
+		s = s[:maxChars] + "…"
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > maxLines {
+		lines = append(lines[:maxLines], "…")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func indentLines(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
 // ── main ──
+
+// pickAgentInteractive lists agents on stdout and starts the chosen runtime.
+func pickAgentInteractive(cli *client.Client) error {
+	agents, err := cli.ListAgents(context.Background())
+	if err != nil {
+		return err
+	}
+	if len(agents) == 0 {
+		return fmt.Errorf("no agents on this server")
+	}
+	fmt.Println("agents:")
+	for i, a := range agents {
+		fmt.Printf("  [%d] %s  (%s)\n", i+1, a.Name, a.ID)
+	}
+	fmt.Print("select agent: ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || n < 1 || n > len(agents) {
+		return fmt.Errorf("invalid selection %q", strings.TrimSpace(line))
+	}
+	fmt.Printf("starting runtime for %s…\n", agents[n-1].Name)
+	return cli.StartRuntime(context.Background(), agents[n-1].ID)
+}
 
 func main() {
 	agentID := flag.String("agent", "", "agent id or name (required)")
@@ -744,11 +1281,6 @@ func main() {
 	mode := flag.String("mode", "", "permission mode: standard | acceptEdits | unrestricted (default: server default)")
 	flag.Parse()
 
-	if *agentID == "" {
-		fmt.Fprintln(os.Stderr, "usage: zc --agent <agent-id-or-name> [--conversation <id>]")
-		os.Exit(2)
-	}
-
 	logFile, logPath, err := client.OpenServerLog()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot open server log: %v\n", err)
@@ -756,21 +1288,36 @@ func main() {
 	}
 	defer logFile.Close()
 
-	fmt.Printf("starting app-server and runtime for %s…\n", *agentID)
-	cli, err := client.Start(context.Background(), client.Options{
+	opts := client.Options{
 		Agent:          *agentID,
 		ConversationID: *conversationID,
 		Port:           *port,
 		Mode:           protocol.PermissionMode(*mode),
 		ServerLog:      logFile,
-	})
+	}
+
+	var cli *client.Client
+	if *agentID == "" {
+		// No agent given: connect first, offer a picker on stdout.
+		fmt.Println("starting app-server…")
+		cli, err = client.Connect(context.Background(), opts)
+		if err == nil {
+			err = pickAgentInteractive(cli)
+		}
+	} else {
+		fmt.Printf("starting app-server and runtime for %s…\n", *agentID)
+		cli, err = client.Start(context.Background(), opts)
+	}
 	if err != nil {
+		if cli != nil {
+			cli.Close()
+		}
 		fmt.Fprintf(os.Stderr, "startup failed: %v\n(server log: %s)\n", err, logPath)
 		os.Exit(1)
 	}
 	defer cli.Close()
 
-	m := newModel(cli, logPath)
+	m := newModel(cli, logPath, *port, logFile)
 	if *conversationID != "" {
 		if msgs, err := cli.MessagesList(context.Background()); err == nil {
 			m.replayHistory(msgs)
