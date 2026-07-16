@@ -812,6 +812,12 @@ func (m *model) openModelPicker() tea.Cmd {
 			if label == "" {
 				label = e.ID
 			}
+			// Variants (reasoning efforts etc.) are distinct catalog ids
+			// that often share a label — surface the id so five identical
+			// "Fable 5" rows are tellable apart.
+			if e.ID != "" && !strings.EqualFold(e.ID, label) {
+				label += " [" + e.ID + "]"
+			}
 			marks := ""
 			if e.IsDefault {
 				marks += " ★"

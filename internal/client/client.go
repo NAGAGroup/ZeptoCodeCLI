@@ -225,6 +225,7 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 		if err != nil {
 			return
 		}
+		debugLogFrame(raw)
 		frame, err := protocol.Decode(raw)
 		if err != nil {
 			continue
@@ -592,6 +593,22 @@ func (c *Client) Close() {
 		_ = c.cmd.Process.Kill()
 		_, _ = c.cmd.Process.Wait()
 	}
+}
+
+// debugLogFrame appends every raw inbound frame to $ZC_DEBUG_FRAMES when
+// set — protocol-drift debugging without a second stream seat (the
+// app-server rejects a second stream channel: 1008).
+func debugLogFrame(raw []byte) {
+	path := os.Getenv("ZC_DEBUG_FRAMES")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(raw, '\n'))
 }
 
 // OpenServerLog is a helper for callers that want the app-server log on disk.
