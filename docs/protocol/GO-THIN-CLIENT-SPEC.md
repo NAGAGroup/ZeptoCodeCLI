@@ -98,7 +98,7 @@ Per SPEC.md §6, the client owns:
 |---|---|---|
 | `/agents` | Agent picker overlay data | `agents_list` → overlay descriptor (§5.5) |
 | `/conversations` | Conversation picker overlay data | `conversations_list` → overlay descriptor |
-| `/jobs` | Jobs panel (native below seam) | `mod_panels_query` (jobs mod panel) or native `/jobs` via `execute_command` |
+| `/jobs` | Mod command (ZeptoCode jobs mod) | `execute_command{/jobs}` → mod handles it server-side; jobs mod also registers a panel via `letta.ui.openPanel` → client renders via `mod_panels_query` |
 | `/new` | Create + switch conversation | `conversation_create` → `change_device_state` |
 | `/mode` | Permission mode cycling | `change_device_state {mode}` |
 | `/model` | Model picker overlay data | `models_list` → overlay descriptor; `update_model` |
@@ -241,27 +241,35 @@ How each inbound protocol frame maps to Go rendering:
 |---|---|
 | `device_status` | Update: `mode` → input border color + statusline pill; `cwd` → statusline; `model` → statusline; `agent_name` → statusline; `conversation_id` → conversation context; `tools` → completion data; `command_catalog` → slash palette data; `background_processes` → /bg overlay; `pending_control_requests` → replay approval modals; `git_context` → statusline branch |
 
-### 5.4 Push frames (unsolicited)
+### 5.4 Push frames (unsolicited, reactive)
+
+Push frames are processed **reactively on arrival** — not via polling. The client subscribes to the frame stream and handles each push frame as it arrives. This is the rule for all push-type events.
 
 | Frame | Go rendering action |
 |---|---|
 | `settings_updated` | Invalidate local settings cache (if any); re-read on next access |
-| `mods_updated` | Refresh mod panel data on next `mod_panels_query` |
+| `mods_updated` | Refresh mod panel data (re-query `mod_panels_query` on next render) |
 | `memory_updated` | Refresh memory list on next /memory access |
 | `skills_updated` | Refresh skills list on next /skills access |
 | `conversations_updated` | Refresh conversation list on next picker open |
 | `notification` | Emit terminal signal (bell/OSC) if client is unfocused; show toast |
 | `should_doctor` | Show doctor warning in statusline |
 
+**Periodic sync (client-implemented, not push):** for background job message visibility — `job_run` sends messages to the conversation via `sendMessageStream`, but an open TUI never refreshes its head. The client may periodically query `conversation_messages_list` (or a "messages since seq_id" query) to pick up these orphaned messages. The client decides the interval (e.g. every 5s); this is NOT a server push — it's a client-initiated periodic sync. This pattern is for cases where the server can't push (the message was sent outside the client's active turn) and the client needs to discover it.
+
 ### 5.5 Overlay frames (§5.5 — pickers, forms, viewers)
+
+The overlay mechanism is the **query-response pattern for interactive data**: the server provides structured data (select items, form fields, etc.), the client decides how to present it (picker, list, grid — its choice), and sends a structured response back (`overlay_event`). This is NOT "server dictates UI" — it's "server provides structured interaction data, client owns presentation."
+
+**Two trigger paths, same renderer:**
+1. **Keybinding-triggered** (ctrl+a, ctrl+p): client sends data-fetch query (`agents_list`, `conversations_list`) → server responds with structured data → client renders its own overlay → client sends action (`change_device_state`, `update_model`) on decision.
+2. **Command-triggered** (`/model` typed): client sends `input_submit{/model}` → server's command handler sends `overlay_state` descriptor with structured data → client renders overlay → client sends `overlay_event{select, item_id}` → server applies and sends `overlay_event_response`.
 
 | Frame | Go rendering action |
 |---|---|
-| `overlay_open {descriptor}` | Render overlay per descriptor type: `select` → overlay list; `multiselect` → overlay list with checkboxes; `form` → sequential form pages; `confirm` → yes/no dialog; `viewer` → pager modal |
-| `overlay_update {items, cursor}` | Update overlay items/filter/selection |
-| `overlay_close` | Close overlay, return to transcript |
-
-The client sends `overlay_event` frames back: `select`, `confirm`, `cancel`, `filter`, `cursor_move`.
+| `overlay_state {stack[]}` | Render the top descriptor per its `kind`: `select` → overlay list; `multiselect` → overlay list with checkboxes; `form` → sequential form pages; `confirm` → yes/no dialog; `viewer`/`pager` → pager modal. The client decides the visual presentation; the descriptor defines the data and outcomes. |
+| `overlay_event` (outbound) | Client sends: `select` (with `item_id`), `submit` (with `values` for forms), `cancel`. This is the response protocol — the structured decision sent back to the server. |
+| `overlay_event_response` (inbound) | Server acknowledges: `ok: true/false`. On success, the server applies the decision and sends updated state (`device_status`, `transcript_sync`, etc.). |
 
 ### 5.6 Command execution
 
@@ -285,11 +293,12 @@ The client sends `overlay_event` frames back: `select`, `confirm`, `cancel`, `fi
 2. `/quit` → client-side (kill child + exit) — stays
 3. Everything else → send as `input_submit {content: "/command args"}` — server routes it
 
-The server's `input_submit` handler already routes `/`-prefixed content through the native command registry (Stage 2). For interactive commands that need overlays, the server sends `overlay_open` descriptors. For data-fetching commands (like /agents), the server can either:
-- Execute the command and send `command_result` with text output, OR
-- Send an `overlay_open` descriptor with the data for a rich picker
+The server's `input_submit` handler already routes `/`-prefixed content through the native command registry (Stage 2). The server decides how to respond:
+- **Text commands** (`/compact`, `/reload`, etc.): server runs the handler, sends `command_result{output: "..."}` → client renders as transcript entry.
+- **Interactive commands** (`/model`, `/agents`, `/skills`, etc.): server's command handler sends `overlay_state` with structured data → client renders overlay → user decides → client sends `overlay_event{select/submit/cancel}` → server applies and acknowledges.
+- **Mod commands** (`/jobs`, `/audit`, etc.): server dispatches to the mod's command handler → `command_result` or `overlay_state` depending on what the mod does.
 
-This means **the Go side doesn't need to know what commands exist**. The `command_catalog` in `device_status` provides autocomplete data, but the actual execution is always server-side.
+**The Go side doesn't need to know what commands exist or which are interactive.** The `command_catalog` in `device_status` provides autocomplete data (names + descriptions + `routing` metadata), but the actual execution and response type are always server-determined. The client processes whatever frame comes back — `command_result` or `overlay_state` — using its generic handlers.
 
 ---
 
@@ -521,18 +530,18 @@ The remaining code is **pure rendering and input** — no domain logic, no FS ac
 
 ---
 
-## 13. Open questions
+## 13. Open questions (resolved 2026-07-16)
 
 | # | Question | Resolution |
 |---|---|---|
-| G1 | Does the server send `overlay_open` for interactive commands (like /agents), or does the client proactively send `agents_list` when it wants to show a picker? | **Server-driven**: the server sends `overlay_open` descriptors when a command requires user interaction. The client never proactively fetches data — it renders what it's told. This means `/agents` → server sends `overlay_open{select, items: [...]}`. The client just renders it. |
-| G2 | How does the client know which commands need overlays vs text output? | It doesn't. The client sends `input_submit{/command}` and the server decides whether to respond with `command_result` (text) or `overlay_open` (interactive). The client handles both. |
-| G3 | What about the startup agent/conversation picker (before the first turn)? | The client sends `agents_list` / `conversations_list` directly (these are data-fetch frames, not commands). The picker is client-side presentation over the served items. This is the one exception to "server-driven overlays" — startup pickers are client-initiated because there's no command to trigger them. |
-| G4 | Does `mod_panels_query` poll periodically, or is it event-driven? | **Client-polled** (SPEC.md Q-A1): client sends `mod_panels_query{width}` on every render frame where panels are visible. The server evaluates renders and returns lines. This matches native render-on-every-frame semantics. |
-| G5 | What happens to `/jobs` (currently a client command that reads local files + HTTP)? | Becomes `execute_command{/jobs}` → server runs the native /jobs mod command → `command_result` with text output. OR: the jobs mod registers a panel → client renders it via `mod_panels_query`. The mod panel approach is better (live updates) but requires the mod to register a panel render function. |
-| G6 | Does the client need to handle `transcript_update` chunks AND `transcript_sync` entries? | **Both** (SPEC.md §5.1): `transcript_update` carries streaming deltas (live token-by-token rendering); `transcript_sync` carries the accumulated entry model (authoritative state). The client renders from `transcript_update` during a turn, then reconciles with `transcript_sync` at turn end. |
-| G7 | How are approval diff previews served? | The `control_request` frame includes `diff_previews` (borrowed from protocol_v2) — the server computes diffs below the seam. The client renders them in the approval modal. No client-side diff computation. |
-| G8 | What about the statusline template (`~/.letta/zc.json`)? | Moves to `settings_read` — the server reads it from the settings file and includes it in `device_status` or a dedicated `statusline_template` field. The client renders the template with substituted values. |
+| G1 | Does the server send `overlay_open` for interactive commands, or does the client proactively query? | **Query-response is the default pattern.** "Server-driven" means the client has no business logic — it doesn't mean the server pushes everything. The client queries data when it needs it, presents it however it wants, and sends the decision back. For keybinding-triggered pickers (ctrl+a, ctrl+p), the client sends data-fetch frames directly (`agents_list`, `conversations_list`). For command-triggered interactions (`/model` typed), the server's command handler sends an `overlay_state` descriptor with structured data. Both paths use the same generic overlay renderer + `overlay_event` response. |
+| G2 | How does the client know which commands need overlays vs text output? | The client handles both response types generically. For a typed `/command`: the client sends `input_submit` (or `execute_command`); the server either returns `command_result` (text → render as entry) or `overlay_state` (structured interaction data → render as picker/form). The client doesn't need to know in advance which type a command produces — it processes whatever frame arrives. The `command_catalog` in `device_status` includes `routing: "interactive"\|"non_state"\|"queued"` metadata, but the client doesn't strictly need it. |
+| G3 | What about startup pickers (before the first turn)? | **Same pattern as all pickers** — no exception. The client sends `agents_list` / `conversations_list` queries, renders the results however it wants (overlay, list, grid), and sends the decision back (reconnect with chosen agent/conversation, or send `change_device_state`). Keybinding-triggered pickers (ctrl+a, ctrl+p) and startup pickers both use direct query-response. Command-triggered pickers (`/agents` typed) go through the server's command handler which sends an `overlay_state` descriptor. |
+| G4 | Does `mod_panels_query` poll periodically, or is it event-driven? | **Reactive (push), not polled.** For things where the protocol should push events to the client, the client processes them via reactive patterns on arrival — not polling. `mod_panels_query` is sent when panels first become visible or terminal width changes; subsequent updates arrive as push frames (`mods_updated`, panel state changes). The server evaluates panel renders and pushes updated lines. This is the rule for all push-type things, not an exception. |
+| G5 | What happens to `/jobs`? | **`/jobs` lives in the mod, not the TUI.** The ZeptoCode jobs mod defines `/jobs` as a Letta-native mod command. Anyone who installs the mod gets `/jobs` in their TUI — it's not a zc-specific command. The TUI sends `execute_command{/jobs}` and the mod handles it server-side. The jobs mod also registers a panel via `letta.ui.openPanel`; the client renders it via `mod_panels_query` for the live-data view. The TUI has no `/jobs` client command. |
+| G6 | `transcript_update` vs `transcript_sync`, and background job message visibility? | **Both** (SPEC.md §5.1): `transcript_update` carries streaming deltas; `transcript_sync` carries the accumulated entry model. Additionally: **the client may periodically sync** (query `conversation_messages_list` or a "messages since seq_id" query) to pick up messages that background jobs sent to the conversation while the TUI was open. This is client-implemented — the client decides the interval (e.g. every 5s). This solves the job_run orphan-message problem: background jobs send messages to the conversation via `sendMessageStream`, but an open TUI never refreshes its head; periodic sync from the client picks them up. |
+| G7 | How are approval diff previews served? | The `control_request` frame includes `diff_previews` — the server computes diffs below the seam. The client renders them in the approval modal. No client-side diff computation. |
+| G8 | What about the statusline? | **Server returns a uniform statusline spec; each client renders it however it wants.** Mods define statusline content via `letta.ui.openPanel({order: 0})`; the server evaluates the render functions and returns structured lines (the format is uniform across all clients). Each client decides *how* to render those lines (layout, colors, wrapping, separators). The statusline spec is a mod-facing spec, not a client-facing one — the server is the intermediary. The old `~/.letta/zc.json` statusline template (zc-specific layout config) stays client-side as a rendering preference, but the *data* it formats comes from the server's uniform statusline spec. |
 
 ---
 
@@ -618,7 +627,7 @@ func (m *model) dispatchSlashCommand(text string) tea.Cmd {
 }
 ```
 
-### Agent picker (before: ~30 lines + ListAgents call; after: overlay frame)
+### Agent picker (before: ~30 lines + ListAgents call; after: query-response)
 
 ```go
 // BEFORE: client fetches data, builds overlay items
@@ -630,7 +639,18 @@ func (m *model) openAgentPicker() tea.Cmd {
     }
 }
 
-// AFTER: server sends overlay_open when /agents is executed
-// (handleFrame receives overlay_open → sets m.overlay from descriptor)
-// No client-side data fetching.
+// AFTER (keybinding-triggered, ctrl+a): client queries, renders, sends decision
+func (m *model) openAgentPicker() tea.Cmd {
+    return func() tea.Msg {
+        agents, _ := m.sc.ListAgents(ctx)  // query: agents_list frame
+        m.overlay = newOverlayFromItems(agents)  // client decides presentation
+        return nil
+    }
+}
+// On user selection: m.sc.SwitchAgent(ctx, selectedID)  // decision sent back
+
+// AFTER (command-triggered, /agents typed): server sends overlay_state descriptor
+// handleFrame receives overlay_state → m.overlay = newOverlayFromDescriptor(desc)
+// On user selection: m.sc.SendOverlayEvent(overlayID, "select", itemID)  // decision sent back
+// Both paths use the same overlay renderer; the difference is who initiates the query.
 ```
