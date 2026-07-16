@@ -447,7 +447,7 @@ func (s *Text) View(width int) string {
 	var b strings.Builder
 	b.WriteString(s.header() + "\n")
 	b.WriteString(s.ta.View() + "\n")
-	b.WriteString(styles.Help.Render("alt+enter / ctrl+j newline · enter submit"))
+	b.WriteString(styles.Help.Render("ctrl+j / alt+enter newline · enter submit"))
 	return railed(strings.TrimRight(b.String(), "\n"))
 }
 

@@ -28,13 +28,16 @@ type keymapT struct {
 
 var keys = keymapT{
 	Send:          key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "send")),
-	Newline:       key.NewBinding(key.WithKeys("alt+enter"), key.WithHelp("alt+enter", "newline")),
+	Newline:       key.NewBinding(key.WithKeys("ctrl+j", "alt+enter"), key.WithHelp("ctrl+j", "newline")),
 	ClearOrAbort:  key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "clear input / abort turn")),
 	Quit:          key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "quit (2× mid-turn)")),
 	Palette:       key.NewBinding(key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "command palette")),
 	Conversations: key.NewBinding(key.WithKeys("ctrl+p"), key.WithHelp("ctrl+p", "conversations")),
 	Agents:        key.NewBinding(key.WithKeys("ctrl+a"), key.WithHelp("ctrl+a", "switch agent")),
-	Jobs:          key.NewBinding(key.WithKeys("ctrl+j"), key.WithHelp("ctrl+j", "jobs/broker panel")),
+	// Jobs is help-view-only: the panel opens via the /jobs client command
+	// (ctrl+j became newline; ctrl+g/ctrl+b clash with zellij/tmux). The f24
+	// dummy key exists because bubbles/help skips keyless bindings.
+	Jobs:          key.NewBinding(key.WithKeys("f24"), key.WithHelp("/jobs", "jobs/broker panel")),
 	Reasoning:     key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "toggle reasoning")),
 	ToolOutput:    key.NewBinding(key.WithKeys("ctrl+o"), key.WithHelp("ctrl+o", "toggle tool output")),
 	Mode:          key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "cycle permission mode")),

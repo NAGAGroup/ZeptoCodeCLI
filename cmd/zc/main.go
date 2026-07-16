@@ -792,10 +792,6 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+k":
 		m.openCommandPalette()
 		return m, nil
-	case "ctrl+j":
-		m.overlay = &overlay{kind: overlayJobs, title: "ZeptoCode jobs + broker", items: jobsOverlayItems()}
-		m.layout()
-		return m, nil
 	case "ctrl+r":
 		m.showReasoning = !m.showReasoning
 		m.refreshViewport()
@@ -844,7 +840,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
-	case "alt+enter":
+	case "ctrl+j", "alt+enter":
 		m.input.InsertString("\n")
 		return m, nil
 	case "up":
@@ -1037,6 +1033,13 @@ var clientCommands = []clientCommand{
 	}},
 	{"conversations", "switch conversation", func(m *model, _ string) tea.Cmd {
 		return m.openConversationPicker()
+	}},
+	// Shadows the ZeptoCode server mod's /jobs on purpose: the native panel
+	// also shows broker status and is available even when the turn is busy.
+	{"jobs", "jobs + broker panel", func(m *model, _ string) tea.Cmd {
+		m.overlay = &overlay{kind: overlayJobs, title: "ZeptoCode jobs + broker", items: jobsOverlayItems()}
+		m.layout()
+		return nil
 	}},
 	{"new", "start a fresh conversation", func(m *model, _ string) tea.Cmd {
 		return m.switchConversation("")
@@ -1252,10 +1255,15 @@ func (m *model) openConversationPicker() tea.Cmd {
 // built-ins for the palette and completion.
 func (m *model) knownCommands() []overlayItem {
 	var items []overlayItem
+	seen := map[string]bool{}
 	for _, c := range clientCommands {
 		items = append(items, overlayItem{id: c.id, title: "/" + c.id, desc: c.desc + " (zc)"})
+		seen[c.id] = true
 	}
 	for _, c := range m.modCmds {
+		if seen[c.ID] { // client commands shadow same-named mod commands (e.g. /jobs)
+			continue
+		}
 		desc := c.Description
 		if c.Args != "" {
 			desc = c.Args + " — " + desc
@@ -1263,6 +1271,9 @@ func (m *model) knownCommands() []overlayItem {
 		items = append(items, overlayItem{id: c.ID, title: "/" + c.ID, desc: desc})
 	}
 	for _, c := range m.supportedCmds {
+		if seen[c] {
+			continue
+		}
 		items = append(items, overlayItem{id: c, title: "/" + c, desc: "built-in"})
 	}
 	return items
@@ -1923,7 +1934,7 @@ func (m *model) statusline() string {
 	if n := len(m.queue); n > 0 {
 		left += styleAccent.Render(fmt.Sprintf(" · %s%d", iconQueue, n))
 	}
-	right := styleInfo.Render("^k cmds · ^p convs · ^j jobs · ^g help ")
+	right := styleInfo.Render("^k cmds · ^p convs · ^j newline · ^g help ")
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		return left
