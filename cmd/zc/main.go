@@ -52,11 +52,6 @@ type toast struct {
 type State struct {
 	phase string // "" | "lobby" | "starting" | "chat"
 
-	// lobby
-	agents          []protocol.AgentItem
-	conversations   []protocol.ConversationItem
-	selectedAgentID string
-
 	// slash-command palette source (pushed on entering chat)
 	commands []protocol.CommandInfo
 
@@ -89,10 +84,8 @@ type model struct {
 
 	st State
 
-	// lobby picker (agents or conversations)
-	picker *overlay
-
-	// chat overlays: slash-command palette + generic tagged selection picker
+	// pickers: slash-command palette + the unified tagged selection picker
+	// (drives BOTH the lobby agent/conversation cascade and in-chat pickers).
 	palette   *overlay
 	selection *overlay
 	selQ      *selectionQuestions
@@ -362,24 +355,11 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 			if fr.AgentName != "" {
 				m.agentName = fr.AgentName
 			}
-			m.picker = nil
+			m.selection = nil // close any open lobby/switch picker
+			m.selQ = nil
 			m.input.Focus()
 		case "lobby", "starting":
-			// wait for agents / conversations pushes
-		}
-
-	case *protocol.Agents:
-		m.st.agents = fr.Items
-		// Open in lobby (startup) and in chat (ctrl+a switch).
-		if m.st.phase == "lobby" || m.st.phase == "chat" {
-			m.openAgentPicker()
-		}
-
-	case *protocol.Conversations:
-		m.st.conversations = fr.Items
-		m.st.selectedAgentID = fr.AgentID
-		if m.st.phase == "lobby" || m.st.phase == "chat" {
-			m.openConversationPicker()
+			// The server pushes a `selection` frame (tag=agent) to drive the lobby.
 		}
 
 	case *protocol.DeviceState:
@@ -423,8 +403,7 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 		m.disconnected = true
 
 	default:
-		// Models, ChangeSignal, Unknown: not consumed
-		// in the current slice.
+		// ChangeSignal, Unknown: not consumed in the current slice.
 	}
 	return nil
 }
@@ -478,81 +457,7 @@ func modPanelTick() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return modPanelTickMsg{} })
 }
 
-// ── lobby pickers ──
 
-func (m *model) openAgentPicker() {
-	var items []overlayItem
-	for _, a := range m.st.agents {
-		name := a.Name
-		if name == "" {
-			name = a.ID
-		}
-		items = append(items, overlayItem{id: a.ID, title: name, desc: a.Model})
-	}
-	m.picker = &overlay{kind: overlayAgents, title: "Select an agent", items: items}
-}
-
-func (m *model) openConversationPicker() {
-	items := []overlayItem{{id: "new", title: "＋ New conversation", desc: "start a fresh conversation"}}
-	for _, c := range m.st.conversations {
-		if c.Archived || c.Hidden {
-			continue
-		}
-		title := c.Title
-		if title == "" {
-			title = c.ID
-		}
-		items = append(items, overlayItem{id: c.ID, title: title, desc: c.LastMessageAt})
-	}
-	m.picker = &overlay{kind: overlayConversations, title: "Select a conversation", items: items}
-}
-
-func (m *model) handlePickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	p := m.picker
-	switch msg.String() {
-	case "ctrl+c":
-		m.quitting = true
-		return m, tea.Quit
-	case "esc":
-		m.quitting = true
-		return m, tea.Quit
-	case "up", "ctrl+p":
-		p.sel--
-		p.clampSel()
-	case "down", "ctrl+n":
-		p.sel++
-		p.clampSel()
-	case "enter":
-		items := p.filtered()
-		if len(items) == 0 {
-			return m, nil
-		}
-		if p.sel < 0 || p.sel >= len(items) {
-			p.sel = 0
-		}
-		it := items[p.sel]
-		switch p.kind {
-		case overlayAgents:
-			m.cli.Send(protocol.NewSelectAgent(it.id))
-			m.picker = nil // await the conversations frame
-		case overlayConversations:
-			m.cli.Send(protocol.NewSelectConversation(it.id))
-			m.picker = nil // await session_phase{starting/chat}
-		}
-	case "backspace":
-		if p.filter != "" {
-			p.filter = p.filter[:len(p.filter)-1]
-			p.clampSel()
-		}
-	default:
-		if len(msg.String()) == 1 {
-			p.filter += msg.String()
-			p.sel = 0
-			p.clampSel()
-		}
-	}
-	return m, nil
-}
 
 // ── slash-command palette (chat phase) ──
 
@@ -808,10 +713,10 @@ func (m *model) commitSelection() (tea.Model, tea.Cmd) {
 // ── key handling (chat phase) ──
 
 func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	// Lobby / starting: only the picker (and quit) are interactive.
+	// Lobby / starting: the server drives a `selection` picker (agent → conv).
 	if m.st.phase != "chat" {
-		if m.picker != nil {
-			return m.handlePickerKey(msg)
+		if m.selection != nil {
+			return m.handleSelectionKey(msg)
 		}
 		if msg.String() == "ctrl+c" {
 			m.quitting = true
@@ -826,10 +731,6 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.selection != nil {
 		return m.handleSelectionKey(msg)
-	}
-	if m.picker != nil {
-		// In-chat agent/conversation switch reuses the lobby picker.
-		return m.handlePickerKey(msg)
 	}
 	if m.question != nil {
 		return m.handleQuestionKey(msg)
@@ -863,10 +764,10 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Mode):
 		return m.cycleMode()
 	case key.Matches(msg, keys.Agents):
-		m.cli.Send(protocol.NewAgentsQuery())
+		m.cli.Send(protocol.NewExecuteCommand("agents"))
 		return m, nil
 	case key.Matches(msg, keys.Conversations):
-		m.cli.Send(protocol.NewConversationsQuery(""))
+		m.cli.Send(protocol.NewExecuteCommand("conversations"))
 		return m, nil
 	case key.Matches(msg, keys.Palette):
 		m.input.SetValue("/")
@@ -1321,7 +1222,7 @@ func (m *model) statusline() string {
 
 	agent := m.agentName
 	if agent == "" {
-		agent = shortID(m.st.selectedAgentID)
+		agent = shortID(m.st.convID)
 	}
 	conv := m.convTitle
 	if conv == "" {
@@ -1408,8 +1309,8 @@ func (m *model) viewContent() string {
 		case m.disconnected:
 			body = styleError.Render("ui-server exited") +
 				styleInfo.Render("\n(server log: "+m.logPath+")\n\npress ctrl+c to exit")
-		case m.picker != nil:
-			body = m.picker.render(max(m.width-4, 32), 18)
+		case m.selection != nil:
+			body = m.selection.render(max(m.width-4, 32), 18)
 		default:
 			body = styleInfo.Render("entering lobby…")
 		}

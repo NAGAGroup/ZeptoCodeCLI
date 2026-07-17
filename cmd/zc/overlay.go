@@ -15,10 +15,8 @@ type overlayKind int
 
 const (
 	overlayNone overlayKind = iota
-	overlayAgents
-	overlayConversations
 	overlayPalette   // slash-command palette over the command_catalog
-	overlaySelection // generic tagged selection (groups / multi / questions)
+	overlaySelection // unified tagged selection (agent/conversation/model pickers, multi, questions)
 )
 
 type overlayItem struct {

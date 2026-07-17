@@ -210,50 +210,9 @@ type ModPanels struct {
 	Panels []ModPanel `json:"panels"`
 }
 
-// AgentItem is one row in the lobby / agent picker.
-type AgentItem struct {
-	ID     string `json:"id"`
-	Name   string `json:"name,omitempty"` // string | null
-	Model  string `json:"model,omitempty"`
-	Pinned bool   `json:"pinned,omitempty"`
-}
-
-// Agents is the agent list for the lobby.
-type Agents struct {
-	Type  string      `json:"type"`
-	Items []AgentItem `json:"items"`
-}
-
-// ConversationItem is one row in the conversation picker.
-type ConversationItem struct {
-	ID            string `json:"id"`
-	Title         string `json:"title,omitempty"`
-	LastMessageAt string `json:"last_message_at,omitempty"`
-	Archived      bool   `json:"archived,omitempty"`
-	Hidden        bool   `json:"hidden,omitempty"`
-}
-
-// Conversations is the conversation list for a given agent.
-type Conversations struct {
-	Type    string             `json:"type"`
-	AgentID string             `json:"agent_id"`
-	Items   []ConversationItem `json:"items"`
-}
-
-// ModelItem is one entry in the structured model catalog.
-type ModelItem struct {
-	ID         string `json:"id"`
-	Handle     string `json:"handle"`
-	Label      string `json:"label,omitempty"`
-	Reasoning  string `json:"reasoning,omitempty"`
-	KeyMissing bool   `json:"key_missing,omitempty"`
-}
-
-// Models is the model catalog.
-type Models struct {
-	Type  string      `json:"type"`
-	Items []ModelItem `json:"items"`
-}
+// NOTE: agent/conversation/model pickers are no longer distinct frames — the
+// server emits a unified `selection` frame (tag=agent|conversation|model) and
+// the client answers with `selection_choice`. See SPEC R23/R24.
 
 // CommandInfo is one slash-command / palette entry.
 type CommandInfo struct {
@@ -412,12 +371,6 @@ func Decode(line []byte) (any, error) {
 		out = new(Selection)
 	case "mod_panels":
 		out = new(ModPanels)
-	case "agents":
-		out = new(Agents)
-	case "conversations":
-		out = new(Conversations)
-	case "models":
-		out = new(Models)
 	case "command_catalog":
 		out = new(CommandCatalog)
 	case "toast":
@@ -464,26 +417,6 @@ type Hello struct {
 
 func NewHello(name, version string) Hello {
 	return Hello{Type: "hello", ProtocolVersion: ProtocolVersion, Client: ClientInfo{Name: name, Version: version}}
-}
-
-// SelectAgent picks an agent in the lobby.
-type SelectAgent struct {
-	Type    string `json:"type"`
-	AgentID string `json:"agent_id"`
-}
-
-func NewSelectAgent(agentID string) SelectAgent {
-	return SelectAgent{Type: "select_agent", AgentID: agentID}
-}
-
-// SelectConversation picks (or creates, id="new") a conversation.
-type SelectConversation struct {
-	Type           string `json:"type"`
-	ConversationID string `json:"conversation_id"`
-}
-
-func NewSelectConversation(conversationID string) SelectConversation {
-	return SelectConversation{Type: "select_conversation", ConversationID: conversationID}
 }
 
 // Attachment is a submitted image reference.
@@ -586,25 +519,6 @@ type ExecuteCommand struct {
 
 func NewExecuteCommand(commandID string) ExecuteCommand {
 	return ExecuteCommand{Type: "execute_command", CommandID: commandID}
-}
-
-// AgentsQuery asks the server to push the agents list.
-type AgentsQuery struct {
-	Type string `json:"type"`
-}
-
-func NewAgentsQuery() AgentsQuery {
-	return AgentsQuery{Type: "agents_query"}
-}
-
-// ConversationsQuery asks the server to push conversations for an agent.
-type ConversationsQuery struct {
-	Type    string `json:"type"`
-	AgentID string `json:"agent_id,omitempty"`
-}
-
-func NewConversationsQuery(agentID string) ConversationsQuery {
-	return ConversationsQuery{Type: "conversations_query", AgentID: agentID}
 }
 
 // SelectionChoice is the committed result of a tagged selection (SPEC R23).

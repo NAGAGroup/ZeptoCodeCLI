@@ -65,19 +65,23 @@ func main() {
 			case *protocol.SessionPhase:
 				phase = fr.Phase
 				fmt.Printf("session_phase: %s\n", fr.Phase)
-			case *protocol.Agents:
-				fmt.Printf("agents: %d\n", len(fr.Items))
-				if !pickedAgent && phase == "lobby" && len(fr.Items) > 0 {
-					pickedAgent = true
-					fmt.Printf("  -> select_agent %s\n", fr.Items[0].ID)
-					c.Send(protocol.NewSelectAgent(fr.Items[0].ID))
+			case *protocol.Selection:
+				fmt.Printf("selection: tag=%s groups=%d\n", fr.Tag, len(fr.Groups))
+				first := ""
+				for _, g := range fr.Groups {
+					if len(g.Items) > 0 {
+						first = g.Items[0].ID
+						break
+					}
 				}
-			case *protocol.Conversations:
-				fmt.Printf("conversations: %d\n", len(fr.Items))
-				if !pickedConv && phase == "lobby" {
+				if fr.Tag == "agent" && !pickedAgent && first != "" {
+					pickedAgent = true
+					fmt.Printf("  -> selection_choice agent %s\n", first)
+					c.Send(protocol.NewSelectionChoice("agent", first))
+				} else if fr.Tag == "conversation" && !pickedConv {
 					pickedConv = true
-					fmt.Println("  -> select_conversation new")
-					c.Send(protocol.NewSelectConversation("new"))
+					fmt.Println("  -> selection_choice conversation new")
+					c.Send(protocol.NewSelectionChoice("conversation", "new"))
 				}
 			case *protocol.DeviceState:
 				fmt.Printf("device: cwd=%s mode=%s model=%s agent=%s\n",
