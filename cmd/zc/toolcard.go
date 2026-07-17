@@ -139,11 +139,15 @@ func toolStatus(l *protocol.TranscriptLine) string {
 func (m *model) phaseDot(l *protocol.TranscriptLine) string {
 	switch l.Phase {
 	case "streaming":
+		// Blink: hide the dot on the "off" half of the tick for a living feel.
+		if !m.blinkOn {
+			return " "
+		}
 		return styleToolPhaseStreaming.Render("●")
 	case "ready", "running":
-		// Blinking dot: use the spinner's current frame for a living feel.
-		if m.spinning {
-			return styleToolPhaseRunning.Render(m.spin.View())
+		// Blink: hide the dot on the "off" half of the tick for a living feel.
+		if !m.blinkOn {
+			return " "
 		}
 		return styleToolPhaseRunning.Render("●")
 	case "finished":

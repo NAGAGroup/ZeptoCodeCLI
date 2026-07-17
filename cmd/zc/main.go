@@ -117,6 +117,8 @@ type model struct {
 	input          textarea.Model
 	spin           spinner.Model
 	spinning       bool
+	blinkOn        bool // toggled by the blink ticker for running/pending tool dots
+	blinking       bool // guards a single in-flight blink ticker
 	helpModel      help.Model
 	showHelp       bool
 	helpScroll     int // scroll offset in the help overlay
@@ -186,6 +188,12 @@ type toastTickMsg struct{}
 type modPanelTickMsg struct{}
 type hintTickMsg struct{}
 type placeholderTickMsg struct{}
+type blinkTickMsg struct{}
+
+// blinkTick drives the running/pending tool phase-dot blink (500ms cadence).
+func blinkTick() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return blinkTickMsg{} })
+}
 
 // Rotating inspirational placeholders shown when the input is empty.
 var placeholderHints = []string{
@@ -371,6 +379,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinning = false
 		return m, nil
 
+	case blinkTickMsg:
+		// Toggle the blink phase, then keep ticking only while a turn is active.
+		m.blinkOn = !m.blinkOn
+		if m.turnActive() {
+			return m, blinkTick()
+		}
+		m.blinking = false
+		m.blinkOn = false
+		return m, nil
+
 	case toastTickMsg:
 		m.pruneToasts()
 		if len(m.st.toasts) > 0 {
@@ -435,6 +453,11 @@ func (m *model) reduceBatch(frames []any) (tea.Model, tea.Cmd) {
 	if m.turnActive() && !m.spinning {
 		m.spinning = true
 		cmds = append(cmds, m.spin.Tick)
+	}
+	if m.turnActive() && !m.blinking {
+		m.blinking = true
+		m.blinkOn = true
+		cmds = append(cmds, blinkTick())
 	}
 	if m.st.phase == "chat" && !m.modPanelPoll {
 		m.modPanelPoll = true
@@ -523,6 +546,11 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 
 	case *protocol.Notification:
 		m.pushToast(fr.Level, fr.Message)
+		// Ring the terminal (OSC 9 + BEL) when the agent needs attention and the
+		// window is unfocused, so the user notices approval/input prompts.
+		if !m.focused && (fr.Reason == "awaiting_approval" || fr.Reason == "awaiting_input") {
+			return tea.Batch(toastTick(), notifyAttention(m.agentName, fr.Message))
+		}
 		return toastTick()
 
 	case *protocol.ErrorFrame:
@@ -663,6 +691,23 @@ func notifyTurnComplete(agentName string) tea.Cmd {
 	}
 }
 
+// notifyAttention pings the terminal (OSC 9 desktop notification + BEL) when the
+// agent is awaiting approval/input and the window is unfocused.
+func notifyAttention(agentName, message string) tea.Cmd {
+	return func() tea.Msg {
+		name := agentName
+		if name == "" {
+			name = "zc"
+		}
+		msg := message
+		if msg == "" {
+			msg = "needs your attention"
+		}
+		fmt.Fprintf(os.Stdout, "\x1b]9;%s: %s\x07\a", name, msg)
+		return nil
+	}
+}
+
 
 
 // ── slash-command palette (chat phase) ──
@@ -699,6 +744,15 @@ func (m *model) handlePaletteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		return m.handleCtrlC()
 	case "esc":
+		// Two-stage: first Esc clears an active filter, second Esc closes.
+		if p.filter != "" {
+			p.filter = ""
+			m.input.SetValue("/")
+			m.input.CursorEnd()
+			p.sel = 0
+			p.clampSel()
+			return m, nil
+		}
 		m.palette = nil
 		m.input.SetValue("")
 		m.autosize()
@@ -845,6 +899,13 @@ func (m *model) handleSelectionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		return m.handleCtrlC()
 	case "esc":
+		// Two-stage: first Esc clears an active filter, second Esc closes.
+		if s.filter != "" {
+			s.filter = ""
+			s.sel = 0
+			s.clampSel()
+			return m, nil
+		}
 		m.selection = nil
 		m.selQ = nil
 		return m, nil
@@ -1413,10 +1474,11 @@ func (m *model) lineCacheKey(l *protocol.TranscriptLine) string {
 	}
 	// Include subagent count so subagent lines re-render when turn changes.
 	subagentHash := len(m.st.turn.ActiveSubagents)
-	return fmt.Sprintf("%s|%d|%d|%d|%s|%s|%s|%d|%v|%v|%v|%d|%d",
+	// Include the blink phase so running/pending tool dots re-render each tick.
+	return fmt.Sprintf("%s|%d|%d|%d|%s|%s|%s|%d|%v|%v|%v|%d|%d|%v",
 		l.Kind, len(l.Text), len(l.ResultText), len(l.Output),
 		l.Phase, ok, success, sc, m.showReasoning, m.showToolOutput, m.isExecuting(l),
-		subagentHash, len(m.st.turn.ExecutingToolCallIDs))
+		subagentHash, len(m.st.turn.ExecutingToolCallIDs), m.blinkOn)
 }
 
 // isExecuting reports whether a tool_call line is currently running client-side
@@ -1830,6 +1892,10 @@ func (m *model) View() tea.View {
 			title += " · " + compactOneLine(conv, 40)
 		}
 	}
+	// Prefix a simple activity marker while a turn is in flight; idle = no marker.
+	if m.turnActive() {
+		title = "● " + title
+	}
 	v.WindowTitle = title
 	return v
 }
@@ -1888,12 +1954,18 @@ func (m *model) viewContent() string {
 	if tl := m.toastLines(); tl != "" {
 		parts = append(parts, tl)
 	}
-	inputBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(modeColor(m.mode)).
-		Width(m.width - 2).
-		Render(m.input.View())
-	parts = append(parts, inputBox)
+	// When a modal/overlay owns input (approval, question, palette, selection),
+	// collapse the textarea to a minimal placeholder line — it's not usable then.
+	if m.palette != nil || m.selection != nil || m.question != nil || len(m.st.pendingApprovals) > 0 {
+		parts = append(parts, styleInfo.Render("  … respond in the dialog above"))
+	} else {
+		inputBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(modeColor(m.mode)).
+			Width(m.width - 2).
+			Render(m.input.View())
+		parts = append(parts, inputBox)
+	}
 	// order == 1 replaces the product-status row (just under the input).
 	if ps := m.panelsProductStatus(); ps != "" {
 		parts = append(parts, ps)
