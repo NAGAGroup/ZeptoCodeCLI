@@ -136,9 +136,11 @@ type model struct {
 	displayTokens int
 
 	// input history recall
-	history    []string
-	historyIdx int
+	history      []string
+	historyIdx   int
+	historyDraft string // preserved draft when browsing history
 
+	escArmed     time.Time // double-escape-to-clear arming
 	ctrlCArmed   time.Time
 	modPanelPoll bool
 	focused      bool
@@ -964,6 +966,10 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.HistoryUp):
 		// Recall only on a single-line buffer; otherwise ↑ moves the cursor.
 		if !strings.Contains(m.input.Value(), "\n") && len(m.history) > 0 {
+			// Preserve the current draft the first time we enter history browsing.
+			if m.historyIdx == len(m.history) {
+				m.historyDraft = m.input.Value()
+			}
 			if m.historyIdx > 0 {
 				m.historyIdx--
 			}
@@ -976,7 +982,8 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if !strings.Contains(m.input.Value(), "\n") && m.historyIdx < len(m.history) {
 			m.historyIdx++
 			if m.historyIdx == len(m.history) {
-				m.input.SetValue("")
+				// Back past the newest entry: restore the preserved draft.
+				m.input.SetValue(m.historyDraft)
 			} else {
 				m.input.SetValue(m.history[m.historyIdx])
 			}
@@ -986,6 +993,9 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	// keys the switch matched-but-declined (history on multiline) fall here.
+
+	// Any content keystroke disarms the double-escape-to-clear window.
+	m.escArmed = time.Time{}
 
 	// Default: the textarea owns the key.
 	var cmd tea.Cmd
@@ -1026,9 +1036,16 @@ func (m *model) handleCtrlC() (tea.Model, tea.Cmd) {
 
 func (m *model) handleEsc() (tea.Model, tea.Cmd) {
 	if m.input.Value() != "" {
-		m.input.SetValue("")
-		m.autosize()
-		return m, nil
+		// Double-escape to clear: first press arms (2.5s), second clears.
+		if !m.escArmed.IsZero() && time.Since(m.escArmed) < 2500*time.Millisecond {
+			m.escArmed = time.Time{}
+			m.input.SetValue("")
+			m.autosize()
+			return m, nil
+		}
+		m.escArmed = time.Now()
+		m.pushStatusHint("info", "press esc again to clear")
+		return m, hintTick()
 	}
 	if m.turnActive() {
 		m.cli.Send(protocol.NewInterrupt())
@@ -1042,8 +1059,12 @@ func (m *model) handleSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.cli.Send(protocol.NewInputSubmit(text))
-	m.history = append(m.history, text)
+	// Deduplicate: don't add an identical consecutive entry (native behavior).
+	if len(m.history) == 0 || m.history[len(m.history)-1] != text {
+		m.history = append(m.history, text)
+	}
 	m.historyIdx = len(m.history)
+	m.historyDraft = ""
 	m.input.SetValue("")
 	m.autosize()
 	return m, nil
