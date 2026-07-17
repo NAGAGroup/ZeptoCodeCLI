@@ -1092,6 +1092,16 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.list.PageDown()
 		return m, nil
 	case key.Matches(msg, keys.HistoryUp):
+		// With a queued message and an empty input, ↑ recalls the most recent
+		// queued message into the input for re-editing (the original stays
+		// queued; there's no protocol event to remove a queue item).
+		if strings.TrimSpace(m.input.Value()) == "" && len(m.st.queue) > 0 {
+			last := m.st.queue[len(m.st.queue)-1]
+			m.input.SetValue(last.Text)
+			m.input.CursorEnd()
+			m.autosize()
+			return m, nil
+		}
 		// Recall only on a single-line buffer; otherwise ↑ moves the cursor.
 		if !strings.Contains(m.input.Value(), "\n") && len(m.history) > 0 {
 			// Preserve the current draft the first time we enter history browsing.
@@ -2083,6 +2093,34 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
 	}
 	cli.Close()
+
+	// Session-end summary: printed to the normal terminal after the TUI's
+	// alt-screen is torn down. Only shown on a clean, user-initiated quit.
+	if m.quitting {
+		printSessionSummary(m)
+	}
+}
+
+// printSessionSummary emits a brief 3-5 line recap of the session to stderr
+// once the bubbletea alt-screen has been released.
+func printSessionSummary(m *model) {
+	name := m.agentName
+	if name == "" {
+		name = "agent"
+	}
+	fmt.Fprintln(os.Stderr, styleInfo.Render("zc — "+name))
+	if m.st.convID != "" {
+		fmt.Fprintln(os.Stderr, "conversation: "+m.st.convID)
+	}
+	if m.st.device != nil && m.st.device.Usage != nil {
+		u := m.st.device.Usage
+		if u.ContextTokens > 0 && u.ContextWindow > 0 {
+			pct := u.ContextTokens * 100 / u.ContextWindow
+			fmt.Fprintf(os.Stderr, "tokens: %s context (%d%%)\n", formatK(u.ContextTokens), pct)
+		} else if u.TotalTokens > 0 {
+			fmt.Fprintf(os.Stderr, "tokens: %s total\n", formatK(u.TotalTokens))
+		}
+	}
 }
 
 func defaultUIBin() string {
