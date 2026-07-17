@@ -156,11 +156,87 @@ func (m *model) renderToolCard(l *protocol.TranscriptLine, w int) string {
 	}
 	header := fmt.Sprintf("%s %s %s%s", icon, nameStyle.Render(name), styleToolParam.Render(params), suffix)
 
+	// Edit/Write/MultiEdit: render a colored diff from the args (native diffview).
+	if diff := m.renderEditDiff(l, w); diff != "" {
+		return header + "\n" + diff
+	}
 	body := m.renderToolBody(l, w)
 	if body == "" {
 		return header
 	}
 	return header + "\n" + body
+}
+
+// renderEditDiff builds a colored +/- diff for Edit/Write/MultiEdit tool cards
+// from the tool arguments (old_string→new_string, or content for Write).
+func (m *model) renderEditDiff(l *protocol.TranscriptLine, w int) string {
+	if l.ArgsText == "" {
+		return ""
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(l.ArgsText), &args); err != nil {
+		return ""
+	}
+	type edit struct{ oldS, newS string }
+	var edits []edit
+	switch l.Name {
+	case "Edit":
+		edits = append(edits, edit{str(args["old_string"]), str(args["new_string"])})
+	case "MultiEdit":
+		if raw, ok := args["edits"].([]any); ok {
+			for _, e := range raw {
+				if em, ok := e.(map[string]any); ok {
+					edits = append(edits, edit{str(em["old_string"]), str(em["new_string"])})
+				}
+			}
+		}
+	case "Write":
+		edits = append(edits, edit{"", str(args["content"])})
+	default:
+		return ""
+	}
+	maxLines := toolBodyCollapsedLines
+	if m.showToolOutput {
+		maxLines = toolBodyExpandedLines
+	}
+	bodyW := max(10, w-4)
+	var out []string
+	for _, e := range edits {
+		if e.oldS != "" {
+			for _, ln := range strings.Split(strings.TrimRight(e.oldS, "\n"), "\n") {
+				out = append(out, styleDiffRemove.Render("  │ - "+compactOneLine(ln, bodyW)))
+			}
+		}
+		if e.newS != "" {
+			for _, ln := range strings.Split(strings.TrimRight(e.newS, "\n"), "\n") {
+				out = append(out, styleDiffAdd.Render("  │ + "+compactOneLine(ln, bodyW)))
+			}
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	shown := out
+	if len(out) > maxLines {
+		shown = out[:maxLines]
+	}
+	res := strings.Join(shown, "\n")
+	if n := len(out) - len(shown); n > 0 {
+		hint := "ctrl+o expands"
+		if m.showToolOutput {
+			hint = "diff capped"
+		}
+		res += "\n" + styleToolBody.Render(fmt.Sprintf("  │ … +%d lines (%s)", n, hint))
+	}
+	return res
+}
+
+// str coerces a JSON value to a string (empty for non-strings/nil).
+func str(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // renderToolBody renders the truncated result: dim lines behind a rail,
