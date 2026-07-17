@@ -854,6 +854,11 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Conversations):
 		m.cli.Send(protocol.NewConversationsQuery(""))
 		return m, nil
+	case key.Matches(msg, keys.Palette):
+		m.input.SetValue("/")
+		m.input.CursorEnd()
+		m.openPalette()
+		return m, nil
 	case key.Matches(msg, keys.ClearOrAbort):
 		return m.handleEsc()
 	case key.Matches(msg, keys.Send):
