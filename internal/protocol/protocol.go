@@ -567,6 +567,20 @@ type ChangeCwd struct {
 	CWD  string `json:"cwd"`
 }
 
+func NewChangeCwd(cwd string) ChangeCwd {
+	return ChangeCwd{Type: "change_cwd", CWD: cwd}
+}
+
+// QueueDeferSet toggles whether queued messages defer until end_turn.
+type QueueDeferSet struct {
+	Type     string `json:"type"`
+	Deferred bool   `json:"deferred"`
+}
+
+func NewQueueDeferSet(deferred bool) QueueDeferSet {
+	return QueueDeferSet{Type: "queue_defer_set", Deferred: deferred}
+}
+
 // ExecuteCommand runs a command explicitly. CommandID is the catalog id with
 // its leading "/" stripped (e.g. "model", "jobs").
 type ExecuteCommand struct {
