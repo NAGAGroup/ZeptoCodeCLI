@@ -140,8 +140,9 @@ type model struct {
 	historyIdx   int
 	historyDraft string // preserved draft when browsing history
 
-	escArmed     time.Time // double-escape-to-clear arming
-	ctrlCArmed   time.Time
+	escArmed       time.Time // double-escape-to-clear arming
+	placeholderIdx int       // rotating placeholder cursor
+	ctrlCArmed     time.Time
 	modPanelPoll bool
 	focused      bool
 	approvalSel  int // cursor in the numbered approval options
@@ -174,6 +175,20 @@ type disconnectedMsg struct{}
 type toastTickMsg struct{}
 type modPanelTickMsg struct{}
 type hintTickMsg struct{}
+type placeholderTickMsg struct{}
+
+// Rotating inspirational placeholders shown when the input is empty.
+var placeholderHints = []string{
+	"Message the agent · esc interrupts · shift+tab mode · ctrl+g help",
+	`Try "help me understand this codebase"`,
+	`Try "debug this error"`,
+	`Try "explain what this function does"`,
+	`Try "review this pull request"`,
+}
+
+func placeholderTick() tea.Cmd {
+	return tea.Tick(6*time.Second, func(time.Time) tea.Msg { return placeholderTickMsg{} })
+}
 
 // waitForFrame blocks for one frame then drains everything already queued so
 // heavy streams collapse into one render per batch. The read loop never drops
@@ -236,7 +251,7 @@ func newModel(cli *client.Client, logPath string, opts client.Options) *model {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.waitForFrame(), textarea.Blink)
+	return tea.Batch(m.waitForFrame(), textarea.Blink, placeholderTick())
 }
 
 // ── list adapter: one transcript Line rendered lazily & memoized ──
@@ -363,6 +378,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, hintTick()
 		}
 		return m, nil
+
+	case placeholderTickMsg:
+		// Rotate the empty-input placeholder through inspirational hints.
+		if m.st.phase == "chat" && strings.TrimSpace(m.input.Value()) == "" {
+			m.placeholderIdx = (m.placeholderIdx + 1) % len(placeholderHints)
+			m.input.Placeholder = placeholderHints[m.placeholderIdx]
+		}
+		return m, placeholderTick()
 	}
 
 	// Form-internal messages (cursor blink) reach the active question form.
@@ -1406,10 +1429,14 @@ func (m *model) renderLine(l *protocol.TranscriptLine, w int) string {
 
 	case "reasoning":
 		if m.showReasoning {
-			return wrap.Render(styleReasoning.Render("· " + l.Text))
+			header := ""
+			if !l.IsContinuation {
+				header = styleReasoning.Render("✻ Thinking…") + "\n"
+			}
+			return header + wrap.Render(styleReasoning.Render("  "+l.Text))
 		}
 		return wrap.Render(styleReasoning.Render(fmt.Sprintf(
-			"· reasoning (%d chars — ctrl+r expands)", len(l.Text))))
+			"✻ reasoning (%d chars — ctrl+r expands)", len(l.Text))))
 
 	case "tool_call":
 		return wrap.Render(m.renderToolCard(l, w))
@@ -1717,14 +1744,16 @@ func (m *model) queueLines() string {
 	if len(m.st.queue) == 0 {
 		return ""
 	}
-	label := "queued"
+	label := "queued · press ↑ to edit"
+	bullet := ">"
 	if m.st.queueDeferred {
-		label = "queued · defer"
+		label = "queued · defer (ctrl+d releases)"
+		bullet = "○"
 	}
 	var lines []string
 	lines = append(lines, styleInfo.Render(fmt.Sprintf("⋯ %d %s", len(m.st.queue), label)))
 	for _, q := range m.st.queue {
-		lines = append(lines, styleInfo.Render("  ↳ "+compactOneLine(q.Text, max(20, m.width-6))))
+		lines = append(lines, styleInfo.Render("  "+bullet+" "+compactOneLine(q.Text, max(20, m.width-6))))
 	}
 	return strings.Join(lines, "\n")
 }
