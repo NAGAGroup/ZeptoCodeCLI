@@ -56,6 +56,10 @@ type State struct {
 	// slash-command palette source (pushed on entering chat)
 	commands []protocol.CommandInfo
 
+	// turn queue (messages submitted while a turn is active)
+	queue         []protocol.QueueItem
+	queueDeferred bool
+
 	// chat
 	transcript       []protocol.TranscriptLine // REPLACED wholesale per `transcript` frame
 	turn             protocol.TurnState        // spinner / gating / interrupt arming
@@ -387,6 +391,10 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 
 	case *protocol.ModPanels:
 		m.st.modPanels = fr.Panels
+
+	case *protocol.QueueState:
+		m.st.queue = fr.Items
+		m.st.queueDeferred = fr.Deferred
 
 	case *protocol.Toast:
 		m.pushToast(fr.Level, fr.Message)
@@ -992,7 +1000,7 @@ func (m *model) autosize() {
 func (m *model) extraHeight() int {
 	h := 2 // input border
 	for _, s := range []string{
-		m.panelsAboveInput(), m.toastLines(), m.panelsProductStatus(),
+		m.panelsAboveInput(), m.queueLines(), m.toastLines(), m.panelsProductStatus(),
 		m.panelsPrimary(), m.panelsBelowPrimary(),
 	} {
 		if s != "" {
@@ -1337,6 +1345,23 @@ func (m *model) panelsProductStatus() string { return m.panelLinesInRange(func(o
 func (m *model) panelsPrimary() string       { return m.panelLinesInRange(func(o int) bool { return o == 0 }) }
 func (m *model) panelsBelowPrimary() string  { return m.panelLinesInRange(func(o int) bool { return o < 0 }) }
 
+// queueLines renders queued messages (submitted mid-turn) above the input.
+func (m *model) queueLines() string {
+	if len(m.st.queue) == 0 {
+		return ""
+	}
+	label := "queued"
+	if m.st.queueDeferred {
+		label = "queued · defer"
+	}
+	var lines []string
+	lines = append(lines, styleInfo.Render(fmt.Sprintf("⋯ %d %s", len(m.st.queue), label)))
+	for _, q := range m.st.queue {
+		lines = append(lines, styleInfo.Render("  ↳ "+compactOneLine(q.Text, max(20, m.width-6))))
+	}
+	return strings.Join(lines, "\n")
+}
+
 // toastLines renders transient toasts (separate from mod panels) above the input.
 func (m *model) toastLines() string {
 	var lines []string
@@ -1404,6 +1429,9 @@ func (m *model) viewContent() string {
 	// Panels with order > 1 render above the input; transient toasts too.
 	if above := m.panelsAboveInput(); above != "" {
 		parts = append(parts, above)
+	}
+	if ql := m.queueLines(); ql != "" {
+		parts = append(parts, ql)
 	}
 	if tl := m.toastLines(); tl != "" {
 		parts = append(parts, tl)

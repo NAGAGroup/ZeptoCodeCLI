@@ -206,6 +206,20 @@ type Selection struct {
 	Questions []SelectionQuestion `json:"questions,omitempty"`
 }
 
+// QueueItem is one queued message (native QueueMessage).
+type QueueItem struct {
+	ID     string `json:"id"`
+	Text   string `json:"text"`
+	Source string `json:"source"`
+}
+
+// QueueState is the turn queue snapshot (messages submitted during a turn).
+type QueueState struct {
+	Type     string      `json:"type"`
+	Items    []QueueItem `json:"items"`
+	Deferred bool        `json:"deferred"`
+}
+
 // ModPanel is one evaluated mod panel's rendered lines.
 type ModPanel struct {
 	ID    string   `json:"id"`
@@ -381,6 +395,8 @@ func Decode(line []byte) (any, error) {
 		out = new(Selection)
 	case "mod_panels":
 		out = new(ModPanels)
+	case "queue":
+		out = new(QueueState)
 	case "command_catalog":
 		out = new(CommandCatalog)
 	case "toast":
