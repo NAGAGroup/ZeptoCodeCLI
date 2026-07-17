@@ -117,8 +117,10 @@ type TurnState struct {
 	ThinkingMessage string `json:"thinking_message,omitempty"`
 	// Tool call ids executing client-side (highlight the live cards).
 	ExecutingToolCallIDs []string `json:"executing_tool_call_ids,omitempty"`
-	StopReason           string   `json:"stop_reason,omitempty"`
-	Error                string   `json:"error,omitempty"`
+	// Names of subagents currently pending/running.
+	ActiveSubagents []string `json:"active_subagents,omitempty"`
+	StopReason      string   `json:"stop_reason,omitempty"`
+	Error           string   `json:"error,omitempty"`
 }
 
 // Active reports whether the turn is non-idle (spinner / interrupt armed).

@@ -129,6 +129,7 @@ type model struct {
 
 	ctrlCArmed   time.Time
 	modPanelPoll bool
+	focused      bool
 	startOpts    client.Options
 }
 
@@ -193,6 +194,7 @@ func newModel(cli *client.Client, logPath string, opts client.Options) *model {
 		streamCache: map[string]*streamMD{},
 		itemsByID:   map[string]*lineItem{},
 		mode:        "?",
+		focused:     true,
 		startOpts:   opts,
 	}
 }
@@ -257,6 +259,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyReleaseMsg:
 		// Kitty-protocol releases must never route anywhere.
+		return m, nil
+
+	case tea.FocusMsg:
+		m.focused = true
+		return m, nil
+
+	case tea.BlurMsg:
+		m.focused = false
 		return m, nil
 
 	case tea.MouseWheelMsg:
@@ -377,7 +387,13 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 		*transcriptChanged = true
 
 	case *protocol.TurnState:
+		wasActive := m.st.turn.Status != "" && m.st.turn.Status != "idle"
 		m.st.turn = *fr
+		// Focus-aware notification: ping the terminal when a turn finishes while
+		// the window is unfocused (native OSC/bell behavior).
+		if wasActive && fr.Status == "idle" && fr.StopReason == "end_turn" && !m.focused {
+			return notifyTurnComplete(m.agentName)
+		}
 
 	case *protocol.PendingApprovals:
 		m.st.pendingApprovals = fr.Items
@@ -464,6 +480,20 @@ func toastTick() tea.Cmd {
 
 func modPanelTick() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return modPanelTickMsg{} })
+}
+
+// notifyTurnComplete pings the terminal (OSC 9 desktop notification + BEL) when
+// a turn finishes while the window is unfocused. OSC sequences don't move the
+// cursor or draw, so they're safe to write mid-alt-screen.
+func notifyTurnComplete(agentName string) tea.Cmd {
+	return func() tea.Msg {
+		name := agentName
+		if name == "" {
+			name = "zc"
+		}
+		fmt.Fprintf(os.Stdout, "\x1b]9;%s finished a turn\x07\a", name)
+		return nil
+	}
 }
 
 
@@ -1257,6 +1287,9 @@ func (m *model) statusline() string {
 	case "error":
 		status = "⚠ " + status
 	}
+	if n := len(m.st.turn.ActiveSubagents); n > 0 {
+		status += fmt.Sprintf(" · %d subagent%s", n, plural(n))
+	}
 	if m.turnActive() {
 		status = m.spin.View() + " " + styleAccent.Render(status)
 	} else {
@@ -1384,6 +1417,7 @@ func (m *model) View() tea.View {
 	v := tea.NewView(m.viewContent())
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
+	v.ReportFocus = true // for focus-aware turn-complete notifications
 	title := "zc"
 	if m.agentName != "" {
 		title += " — " + m.agentName
@@ -1551,4 +1585,11 @@ func defaultUIServerPath() string {
 		return p
 	}
 	return os.ExpandEnv("$HOME/projects/letta-code/src/cli/subcommands/ui-server.ts")
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
