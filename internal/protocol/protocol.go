@@ -516,8 +516,9 @@ type ApprovalResponse struct {
 	ID                    string         `json:"id"` // tool_call_id
 	Decision              string         `json:"decision"`
 	Message               string         `json:"message,omitempty"`
-	UpdatedInput          map[string]any `json:"updated_input,omitempty"`
-	SelectedSuggestionIDs []string       `json:"selected_permission_suggestion_ids,omitempty"`
+	UpdatedInput          map[string]any     `json:"updated_input,omitempty"`
+	SelectedSuggestionIDs []string           `json:"selected_permission_suggestion_ids,omitempty"`
+	Answers               map[string]string  `json:"answers,omitempty"` // AskUserQuestion: question id -> answer
 }
 
 func NewApprovalResponse(id, decision string) ApprovalResponse {

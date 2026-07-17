@@ -105,20 +105,42 @@ func (qf *questionForm) answers() map[string]string {
 	return out
 }
 
-// response builds the approval_response event: allow, with updated_input
-// preserving the original tool input plus an `answers` map.
+// response builds the approval_response event: allow, with answers keyed by
+// question id (R23). The server maps these back into the original AskUserQuestion
+// input so the turn can continue.
 func (qf *questionForm) response() protocol.ApprovalResponse {
-	updated := map[string]any{}
-	for k, v := range qf.approval.Input {
-		updated[k] = v
-	}
-	answers := map[string]any{}
-	for k, v := range qf.answers() {
-		answers[k] = v
-	}
-	updated["answers"] = answers
-
 	resp := protocol.NewApprovalResponse(qf.id, "allow")
-	resp.UpdatedInput = updated
+	resp.Answers = qf.answersByID()
 	return resp
+}
+
+// answersByID returns the answer for each question keyed by its id.
+func (qf *questionForm) answersByID() map[string]string {
+	out := map[string]string{}
+	for i, q := range qf.questions {
+		id := q.ID
+		if id == "" {
+			id = q.Prompt
+		}
+		if q.Multi {
+			var vals []string
+			for _, v := range qf.multi[i] {
+				if v == otherSentinel {
+					if strings.TrimSpace(qf.other[i]) != "" {
+						vals = append(vals, strings.TrimSpace(qf.other[i]))
+					}
+				} else {
+					vals = append(vals, v)
+				}
+			}
+			out[id] = strings.Join(vals, ", ")
+		} else {
+			if qf.single[i] == otherSentinel {
+				out[id] = strings.TrimSpace(qf.other[i])
+			} else {
+				out[id] = qf.single[i]
+			}
+		}
+	}
+	return out
 }
