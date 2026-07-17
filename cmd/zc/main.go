@@ -1281,7 +1281,13 @@ func (m *model) statusline() string {
 	left += status
 	if m.st.device != nil && m.st.device.Usage != nil {
 		u := m.st.device.Usage
-		left += styleInfo.Render(fmt.Sprintf(" · %s", formatK(u.TotalTokens)))
+		// Persistent context-window occupancy when known; else session tokens.
+		if u.ContextTokens > 0 && u.ContextWindow > 0 {
+			pct := u.ContextTokens * 100 / u.ContextWindow
+			left += styleInfo.Render(fmt.Sprintf(" · %s/%s (%d%%)", formatK(u.ContextTokens), formatK(u.ContextWindow), pct))
+		} else {
+			left += styleInfo.Render(fmt.Sprintf(" · %s", formatK(u.TotalTokens)))
+		}
 	}
 
 	right := styleInfo.Render("esc interrupt · shift+tab mode · ^g help ")

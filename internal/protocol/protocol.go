@@ -74,10 +74,12 @@ type DeviceConversation struct {
 
 // DeviceUsage carries token/cost counters for the statusline.
 type DeviceUsage struct {
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	TotalTokens  int     `json:"total_tokens"`
-	CostUSD      float64 `json:"cost_usd,omitempty"`
+	InputTokens   int     `json:"input_tokens"`
+	OutputTokens  int     `json:"output_tokens"`
+	TotalTokens   int     `json:"total_tokens"`
+	CostUSD       float64 `json:"cost_usd,omitempty"`
+	ContextTokens int     `json:"context_tokens,omitempty"`
+	ContextWindow int     `json:"context_window,omitempty"`
 }
 
 // DeviceState is ambient status the statusline/header renders from.
