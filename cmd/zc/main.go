@@ -130,6 +130,7 @@ type model struct {
 	ctrlCArmed   time.Time
 	modPanelPoll bool
 	focused      bool
+	approvalSel  int // cursor in the numbered approval options
 	startOpts    client.Options
 }
 
@@ -935,25 +936,63 @@ func (m *model) cycleMode() (tea.Model, tea.Cmd) {
 
 // ── approval / question modal ──
 
+// approvalOptionCount returns the number of numbered options for the head
+// approval: "Yes" + one per permission suggestion + "No".
+func (m *model) approvalOptionCount() int {
+	if len(m.st.pendingApprovals) == 0 {
+		return 0
+	}
+	return 2 + len(m.st.pendingApprovals[0].PermissionSuggestions) // Yes + suggestions + No
+}
+
+// sendApprovalChoice sends the response for the selected numbered option.
+func (m *model) sendApprovalChoice(sel int) {
+	a := m.st.pendingApprovals[0]
+	last := m.approvalOptionCount() - 1
+	switch {
+	case sel == 0: // Yes
+		m.cli.Send(protocol.NewApprovalResponse(a.ID, "allow"))
+	case sel == last: // No
+		m.cli.Send(protocol.NewApprovalResponse(a.ID, "deny"))
+	default: // Yes + permission suggestion
+		resp := protocol.NewApprovalResponse(a.ID, "allow")
+		resp.SelectedSuggestionIDs = []string{a.PermissionSuggestions[sel-1].ID}
+		m.cli.Send(resp)
+	}
+}
+
 func (m *model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if len(m.st.pendingApprovals) == 0 {
 		return m, nil
 	}
 	a := m.st.pendingApprovals[0]
+	n := m.approvalOptionCount()
 	switch msg.String() {
 	case "ctrl+c":
 		m.quitting = true
 		return m, tea.Quit
-	case "a", "y":
-		m.cli.Send(protocol.NewApprovalResponse(a.ID, "allow"))
-	case "d", "n", "esc":
+	case "up", "ctrl+p":
+		if m.approvalSel > 0 {
+			m.approvalSel--
+		}
+	case "down", "ctrl+n":
+		if m.approvalSel < n-1 {
+			m.approvalSel++
+		}
+	case "enter":
+		m.sendApprovalChoice(m.approvalSel)
+	case "esc":
+		m.cli.Send(protocol.NewApprovalResponse(a.ID, "deny"))
+	case "y":
+		m.sendApprovalChoice(0)
+	case "d", "n":
 		m.cli.Send(protocol.NewApprovalResponse(a.ID, "deny"))
 	default:
-		// number keys pick a permission suggestion (allow + grant).
-		if n := int(msg.String()[0]) - '1'; len(msg.String()) == 1 && n >= 0 && n < len(a.PermissionSuggestions) {
-			resp := protocol.NewApprovalResponse(a.ID, "allow")
-			resp.SelectedSuggestionIDs = []string{a.PermissionSuggestions[n].ID}
-			m.cli.Send(resp)
+		// Number keys jump to and select an option directly (1-indexed).
+		if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+			if idx := int(s[0]-'1'); idx < n {
+				m.sendApprovalChoice(idx)
+			}
 		}
 	}
 	// Do not mutate locally — the server pushes the authoritative next
@@ -964,6 +1003,7 @@ func (m *model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // syncApprovalUI opens/closes the AskUserQuestion form based on the head of
 // the pending_approvals array.
 func (m *model) syncApprovalUI() tea.Cmd {
+	m.approvalSel = 0 // reset the numbered-option cursor for the new head
 	if len(m.st.pendingApprovals) == 0 {
 		m.question = nil
 		return nil
