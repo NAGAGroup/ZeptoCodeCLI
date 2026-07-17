@@ -597,11 +597,24 @@ func (m *model) handlePaletteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "down", "ctrl+n":
 		p.move(1)
 	case "enter", "tab":
-		it, ok := p.current()
-		if !ok {
-			return m, nil
+		// Prefer an EXACT id match over the highlighted fuzzy row so typing a
+		// full command ("/context") never runs a prefix sibling ("/context-limit").
+		typed := "/" + strings.TrimSpace(p.filter)
+		chosen := ""
+		for _, it := range p.items {
+			if it.id == typed {
+				chosen = it.id
+				break
+			}
 		}
-		m.cli.Send(protocol.NewExecuteCommand(strings.TrimPrefix(it.id, "/")))
+		if chosen == "" {
+			it, ok := p.current()
+			if !ok {
+				return m, nil
+			}
+			chosen = it.id
+		}
+		m.cli.Send(protocol.NewExecuteCommand(strings.TrimPrefix(chosen, "/")))
 		m.palette = nil
 		m.input.SetValue("")
 		m.autosize()
