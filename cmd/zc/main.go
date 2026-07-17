@@ -250,6 +250,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
+	case tea.PasteMsg:
+		if m.st.phase == "chat" {
+			m.cli.Send(protocol.NewInputPaste(msg.Content))
+		}
+		return m, nil
+
 	case tea.KeyReleaseMsg:
 		// Kitty-protocol releases must never route anywhere.
 		return m, nil

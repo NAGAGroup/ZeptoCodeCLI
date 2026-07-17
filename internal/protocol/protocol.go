@@ -510,6 +510,16 @@ func NewInputSubmit(text string) InputSubmit {
 	return InputSubmit{Type: "input_submit", Text: text}
 }
 
+// InputPaste sends pasted multi-line content as a user message.
+type InputPaste struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+func NewInputPaste(text string) InputPaste {
+	return InputPaste{Type: "input_paste", Text: text}
+}
+
 // ApprovalResponse answers a pending_approvals item.
 type ApprovalResponse struct {
 	Type                  string         `json:"type"`
