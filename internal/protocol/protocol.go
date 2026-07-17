@@ -145,21 +145,6 @@ type SelectionOption struct {
 	Description string `json:"description,omitempty"`
 }
 
-// PendingSelection is a server-initiated option choice.
-type PendingSelection struct {
-	ID      string            `json:"id"`
-	Kind    string            `json:"kind"`
-	Title   string            `json:"title,omitempty"`
-	Options []SelectionOption `json:"options"`
-	Multi   bool              `json:"multi,omitempty"`
-}
-
-// PendingSelections is the pending-selections array.
-type PendingSelections struct {
-	Type  string             `json:"type"`
-	Items []PendingSelection `json:"items"`
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Tagged selection (SPEC R23) — stateless: the server returns options in
 // response to a query or a picker command; the client renders + picks; the
@@ -414,8 +399,6 @@ func Decode(line []byte) (any, error) {
 		out = new(TurnState)
 	case "pending_approvals":
 		out = new(PendingApprovals)
-	case "pending_selections":
-		out = new(PendingSelections)
 	case "selection":
 		out = new(Selection)
 	case "mod_panels":
@@ -533,14 +516,6 @@ type ApprovalResponse struct {
 
 func NewApprovalResponse(id, decision string) ApprovalResponse {
 	return ApprovalResponse{Type: "approval_response", ID: id, Decision: decision}
-}
-
-// SelectionResponse answers a pending_selections item.
-type SelectionResponse struct {
-	Type    string   `json:"type"`
-	ID      string   `json:"id"`
-	Choice  string   `json:"choice,omitempty"`
-	Choices []string `json:"choices,omitempty"`
 }
 
 // Interrupt aborts the active turn (esc).

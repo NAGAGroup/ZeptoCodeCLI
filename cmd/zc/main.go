@@ -422,7 +422,7 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 		m.disconnected = true
 
 	default:
-		// Models, PendingSelections, ChangeSignal, Unknown: not consumed
+		// Models, ChangeSignal, Unknown: not consumed
 		// in the current slice.
 	}
 	return nil
