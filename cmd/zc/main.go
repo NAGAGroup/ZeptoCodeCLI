@@ -56,6 +56,9 @@ type State struct {
 	conversations   []protocol.ConversationItem
 	selectedAgentID string
 
+	// slash-command palette source (pushed on entering chat)
+	commands []protocol.CommandInfo
+
 	// chat
 	transcript       []protocol.TranscriptLine // REPLACED wholesale per `transcript` frame
 	turn             protocol.TurnState        // spinner / gating / interrupt arming
@@ -87,6 +90,11 @@ type model struct {
 
 	// lobby picker (agents or conversations)
 	picker *overlay
+
+	// chat overlays: slash-command palette + generic tagged selection picker
+	palette   *overlay
+	selection *overlay
+	selQ      *selectionQuestions
 
 	// chat UI
 	list           *list.List
@@ -382,6 +390,12 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 		m.st.pendingApprovals = fr.Items
 		return m.syncApprovalUI()
 
+	case *protocol.CommandCatalog:
+		m.st.commands = fr.Commands
+
+	case *protocol.Selection:
+		m.openSelection(fr)
+
 	case *protocol.ModPanels:
 		m.st.modPanels = fr.Panels
 
@@ -401,8 +415,8 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 		m.disconnected = true
 
 	default:
-		// Models, CommandCatalog, PendingSelections, ChangeSignal, Unknown:
-		// not consumed in the Stage 0/1 slice.
+		// Models, PendingSelections, ChangeSignal, Unknown: not consumed
+		// in the current slice.
 	}
 	return nil
 }
@@ -532,6 +546,244 @@ func (m *model) handlePickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// ── slash-command palette (chat phase) ──
+
+// openPalette builds the slash-command palette from the stored command_catalog.
+// Hidden commands are omitted. The filter is the text the user types after "/"
+// (client-side only — the catalog is already pushed; no per-keystroke IO).
+func (m *model) openPalette() {
+	var items []overlayItem
+	for _, c := range m.st.commands {
+		if c.Hidden {
+			continue
+		}
+		desc := c.Description
+		if c.ArgsHint != "" {
+			desc = strings.TrimSpace(desc + " " + c.ArgsHint)
+		}
+		items = append(items, overlayItem{
+			id:    c.ID, // includes leading "/"
+			title: c.ID,
+			desc:  desc,
+			badge: c.Source, // builtin | custom | mod
+		})
+	}
+	m.palette = &overlay{kind: overlayPalette, title: "Commands", items: items}
+	m.palette.clampSel()
+}
+
+// handlePaletteKey routes keys while the slash palette is open. Enter executes
+// the highlighted command via execute_command (id stripped of its leading "/").
+func (m *model) handlePaletteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	p := m.palette
+	switch msg.String() {
+	case "ctrl+c":
+		return m.handleCtrlC()
+	case "esc":
+		m.palette = nil
+		m.input.SetValue("")
+		m.autosize()
+		return m, nil
+	case "up", "ctrl+p":
+		p.move(-1)
+	case "down", "ctrl+n":
+		p.move(1)
+	case "enter", "tab":
+		it, ok := p.current()
+		if !ok {
+			return m, nil
+		}
+		m.cli.Send(protocol.NewExecuteCommand(strings.TrimPrefix(it.id, "/")))
+		m.palette = nil
+		m.input.SetValue("")
+		m.autosize()
+		return m, nil
+	case "backspace":
+		if p.filter == "" {
+			// backspacing past the "/" closes the palette.
+			m.palette = nil
+			m.input.SetValue("")
+			m.autosize()
+			return m, nil
+		}
+		p.filter = p.filter[:len(p.filter)-1]
+		m.input.SetValue("/" + p.filter)
+		m.input.CursorEnd()
+		p.sel = 0
+		p.clampSel()
+	default:
+		if s := msg.String(); len(s) == 1 && s >= " " {
+			p.filter += s
+			m.input.SetValue("/" + p.filter)
+			m.input.CursorEnd()
+			p.sel = 0
+			p.clampSel()
+		}
+	}
+	return m, nil
+}
+
+// ── tagged selection picker (SPEC R23) ──
+
+// selectionQuestions steps a multi-question Selection (AskUserQuestion). This
+// primarily arrives via pending_approvals in a later stage; here we wire a
+// basic sequential single-select renderer so a `selection` with questions is
+// handled instead of crashing.
+type selectionQuestions struct {
+	tag       string
+	questions []protocol.SelectionQuestion
+	idx       int
+	answers   map[string]string
+}
+
+// openSelection opens the tagged picker for a `selection` frame. Groups render
+// as a grouped/multi picker; questions render as a sequential stepper.
+func (m *model) openSelection(s *protocol.Selection) {
+	// Clear the palette if one was open — the command produced a selection.
+	m.palette = nil
+	m.selection = nil
+	m.selQ = nil
+
+	if len(s.Groups) > 0 {
+		var items []overlayItem
+		for _, g := range s.Groups {
+			if g.Label != "" {
+				items = append(items, overlayItem{title: g.Label, header: true})
+			}
+			for _, it := range g.Items {
+				items = append(items, overlayItem{
+					id:       it.ID,
+					title:    it.Label,
+					desc:     it.Description,
+					badge:    it.Badge,
+					disabled: it.Disabled,
+				})
+			}
+		}
+		title := s.Title
+		if title == "" {
+			title = "Select"
+		}
+		m.selection = &overlay{
+			kind:     overlaySelection,
+			title:    title,
+			items:    items,
+			tag:      s.Tag,
+			multi:    s.Multi,
+			selected: map[string]bool{},
+		}
+		m.selection.clampSel()
+		return
+	}
+
+	if len(s.Questions) > 0 {
+		m.selQ = &selectionQuestions{tag: s.Tag, questions: s.Questions, answers: map[string]string{}}
+		m.openSelectionQuestion()
+	}
+}
+
+// openSelectionQuestion builds the picker for the current question in a
+// sequential multi-question selection.
+func (m *model) openSelectionQuestion() {
+	q := m.selQ.questions[m.selQ.idx]
+	var items []overlayItem
+	for _, o := range q.Options {
+		items = append(items, overlayItem{id: o.ID, title: o.Label, desc: o.Description, badge: o.Badge, disabled: o.Disabled})
+	}
+	title := q.Prompt
+	if len(m.selQ.questions) > 1 {
+		title = fmt.Sprintf("%s (%d/%d)", q.Prompt, m.selQ.idx+1, len(m.selQ.questions))
+	}
+	m.selection = &overlay{
+		kind:     overlaySelection,
+		title:    title,
+		items:    items,
+		tag:      m.selQ.tag,
+		selected: map[string]bool{},
+	}
+	m.selection.clampSel()
+}
+
+// handleSelectionKey routes keys while a tagged selection picker is open.
+func (m *model) handleSelectionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	s := m.selection
+	switch msg.String() {
+	case "ctrl+c":
+		return m.handleCtrlC()
+	case "esc":
+		m.selection = nil
+		m.selQ = nil
+		return m, nil
+	case "up", "ctrl+p":
+		s.move(-1)
+	case "down", "ctrl+n":
+		s.move(1)
+	case " ":
+		if s.multi {
+			if it, ok := s.current(); ok {
+				s.toggle(it.id)
+			}
+		}
+	case "enter":
+		return m.commitSelection()
+	case "backspace":
+		if s.filter != "" {
+			s.filter = s.filter[:len(s.filter)-1]
+			s.sel = 0
+			s.clampSel()
+		}
+	default:
+		if str := msg.String(); len(str) == 1 && str >= " " {
+			s.filter += str
+			s.sel = 0
+			s.clampSel()
+		}
+	}
+	return m, nil
+}
+
+// commitSelection sends the selection_choice for the current picker. For a
+// question stepper it records the answer and advances (or sends `answers`
+// once the last question is answered).
+func (m *model) commitSelection() (tea.Model, tea.Cmd) {
+	s := m.selection
+
+	// Multi-question stepper.
+	if m.selQ != nil {
+		it, ok := s.current()
+		if !ok {
+			return m, nil
+		}
+		q := m.selQ.questions[m.selQ.idx]
+		m.selQ.answers[q.ID] = it.id
+		m.selQ.idx++
+		if m.selQ.idx >= len(m.selQ.questions) {
+			m.cli.Send(protocol.NewSelectionAnswers(m.selQ.tag, m.selQ.answers))
+			m.selection = nil
+			m.selQ = nil
+			return m, nil
+		}
+		m.openSelectionQuestion()
+		return m, nil
+	}
+
+	// Multi-select: confirm the toggled set.
+	if s.multi {
+		m.cli.Send(protocol.NewSelectionChoices(s.tag, s.chosen()))
+		m.selection = nil
+		return m, nil
+	}
+
+	// Single-select.
+	it, ok := s.current()
+	if !ok {
+		return m, nil
+	}
+	m.cli.Send(protocol.NewSelectionChoice(s.tag, it.id))
+	m.selection = nil
+	return m, nil
+}
+
 // ── key handling (chat phase) ──
 
 func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -548,6 +800,12 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Modals take the slot, in priority order.
+	if m.palette != nil {
+		return m.handlePaletteKey(msg)
+	}
+	if m.selection != nil {
+		return m.handleSelectionKey(msg)
+	}
 	if m.question != nil {
 		return m.handleQuestionKey(msg)
 	}
@@ -559,6 +817,15 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "esc", "ctrl+g", "q":
 			m.showHelp = false
 		}
+		return m, nil
+	}
+
+	// A leading "/" on an empty buffer opens the slash-command palette. The
+	// palette then filters client-side over the already-pushed catalog.
+	if msg.String() == "/" && strings.TrimSpace(m.input.Value()) == "" {
+		m.input.SetValue("/")
+		m.input.CursorEnd()
+		m.openPalette()
 		return m, nil
 	}
 

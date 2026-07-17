@@ -160,6 +160,48 @@ type PendingSelections struct {
 	Items []PendingSelection `json:"items"`
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Tagged selection (SPEC R23) — stateless: the server returns options in
+// response to a query or a picker command; the client renders + picks; the
+// client sends selection_choice{tag,...}; the server dispatches on `tag`.
+// Mirrors protocol.ts SelectionItem/SelectionGroup/SelectionQuestion/Selection.
+// ─────────────────────────────────────────────────────────────────────
+
+// SelectionItem is one pickable row in a tagged selection.
+type SelectionItem struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Badge       string `json:"badge,omitempty"` // e.g. "local", "no key", "★"
+	Disabled    bool   `json:"disabled,omitempty"`
+}
+
+// SelectionGroup is a labeled cluster of selection items ("Pinned", "Recent").
+type SelectionGroup struct {
+	Label string          `json:"label,omitempty"`
+	Items []SelectionItem `json:"items"`
+}
+
+// SelectionQuestion is one prompt in a multi-question selection
+// (AskUserQuestion). Absent Options ⇒ free-text.
+type SelectionQuestion struct {
+	ID      string          `json:"id"`
+	Prompt  string          `json:"prompt"`
+	Options []SelectionItem `json:"options,omitempty"`
+	Multi   bool            `json:"multi,omitempty"`
+}
+
+// Selection is a stateless tagged picker (grouped items and/or multi-question).
+// The server dispatches the returned choice on Tag.
+type Selection struct {
+	Type      string              `json:"type"`
+	Tag       string              `json:"tag"`
+	Title     string              `json:"title,omitempty"`
+	Multi     bool                `json:"multi,omitempty"`
+	Groups    []SelectionGroup    `json:"groups,omitempty"`
+	Questions []SelectionQuestion `json:"questions,omitempty"`
+}
+
 // ModPanel is one evaluated mod panel's rendered lines.
 type ModPanel struct {
 	ID    string   `json:"id"`
@@ -374,6 +416,8 @@ func Decode(line []byte) (any, error) {
 		out = new(PendingApprovals)
 	case "pending_selections":
 		out = new(PendingSelections)
+	case "selection":
+		out = new(Selection)
 	case "mod_panels":
 		out = new(ModPanels)
 	case "agents":
@@ -512,11 +556,40 @@ type ChangeCwd struct {
 	CWD  string `json:"cwd"`
 }
 
-// ExecuteCommand runs a command explicitly.
+// ExecuteCommand runs a command explicitly. CommandID is the catalog id with
+// its leading "/" stripped (e.g. "model", "jobs").
 type ExecuteCommand struct {
 	Type      string `json:"type"`
 	CommandID string `json:"command_id"`
 	Args      string `json:"args,omitempty"`
+}
+
+func NewExecuteCommand(commandID string) ExecuteCommand {
+	return ExecuteCommand{Type: "execute_command", CommandID: commandID}
+}
+
+// SelectionChoice is the committed result of a tagged selection (SPEC R23).
+// The Tag (echoed from the Selection) tells the server how to dispatch.
+type SelectionChoice struct {
+	Type    string            `json:"type"`
+	Tag     string            `json:"tag"`
+	Choice  string            `json:"choice,omitempty"`  // single-select
+	Choices []string          `json:"choices,omitempty"` // multi-select
+	Answers map[string]string `json:"answers,omitempty"` // multi-question
+}
+
+func NewSelectionChoice(tag, choice string) SelectionChoice {
+	return SelectionChoice{Type: "selection_choice", Tag: tag, Choice: choice}
+}
+
+// NewSelectionChoices builds a multi-select result.
+func NewSelectionChoices(tag string, choices []string) SelectionChoice {
+	return SelectionChoice{Type: "selection_choice", Tag: tag, Choices: choices}
+}
+
+// NewSelectionAnswers builds a multi-question result.
+func NewSelectionAnswers(tag string, answers map[string]string) SelectionChoice {
+	return SelectionChoice{Type: "selection_choice", Tag: tag, Answers: answers}
 }
 
 // ModPanelsQuery polls evaluated panel lines at a width.

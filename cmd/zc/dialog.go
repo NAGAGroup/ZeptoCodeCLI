@@ -40,6 +40,10 @@ func dialogWidth(termW int) int {
 func (m *model) activeDialog() string {
 	w := dialogWidth(m.width)
 	switch {
+	case m.palette != nil:
+		return m.palette.render(w, 18)
+	case m.selection != nil:
+		return m.selection.render(w, 18)
 	case m.question != nil:
 		return dialogBox("agent asks", "esc dismisses = deny",
 			m.question.form.View(w-4), w)
