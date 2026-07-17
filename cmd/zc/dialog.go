@@ -43,7 +43,12 @@ func (m *model) activeDialog() string {
 	w := dialogWidth(m.width)
 	switch {
 	case m.palette != nil:
-		return m.palette.render(w, 18)
+		box := m.palette.render(w, 18)
+		// Small dim info line below the palette: agent · model · mode.
+		if info := m.paletteInfoBar(); info != "" {
+			box += "\n" + info
+		}
+		return box
 	case m.selection != nil:
 		return m.selection.render(w, 18)
 	case m.question != nil:
@@ -52,10 +57,121 @@ func (m *model) activeDialog() string {
 	case len(m.st.pendingApprovals) > 0:
 		return m.renderModal()
 	case m.showHelp:
-		return dialogBox("keybindings", "esc or ctrl+g closes",
-			m.helpModel.FullHelpView(keys.FullHelp()), w)
+		return m.renderHelp(w)
 	}
 	return ""
+}
+
+// paletteInfoBar renders a dim one-liner shown under the command palette:
+// agent name · model · permission mode.
+func (m *model) paletteInfoBar() string {
+	var parts []string
+	if a := m.agentName; a != "" {
+		parts = append(parts, a)
+	}
+	if md := shortModel(m.modelHandle); md != "" {
+		parts = append(parts, md)
+	}
+	mode := string(m.mode)
+	if mode == "" {
+		mode = "?"
+	}
+	parts = append(parts, mode)
+	return styleInfo.Render("  " + strings.Join(parts, " · "))
+}
+
+// helpLines builds the full (unscrolled) help body: a "Commands" section from
+// the pushed command catalog (non-hidden) and a "Keyboard shortcuts" section
+// from the keymap.
+func (m *model) helpLines(w int) []string {
+	const keyW = 16
+	descW := max(10, w-4-keyW-1)
+	var lines []string
+
+	lines = append(lines, styleOverlayTitle.Render("Commands"))
+	shown := 0
+	for _, c := range m.st.commands {
+		if c.Hidden {
+			continue
+		}
+		desc := c.Description
+		if c.ArgsHint != "" {
+			desc = strings.TrimSpace(desc + " " + c.ArgsHint)
+		}
+		lines = append(lines, "  "+lipglossStyleKey.Render(padRight(c.ID, keyW))+
+			styleInfo.Render(truncPlain(desc, descW)))
+		shown++
+	}
+	if shown == 0 {
+		lines = append(lines, styleInfo.Render("  (no commands)"))
+	}
+
+	lines = append(lines, "", styleOverlayTitle.Render("Keyboard shortcuts"))
+	seen := map[string]bool{}
+	for _, col := range keys.FullHelp() {
+		for _, b := range col {
+			h := b.Help()
+			if h.Key == "" || seen[h.Key] {
+				continue
+			}
+			seen[h.Key] = true
+			lines = append(lines, "  "+lipglossStyleKey.Render(padRight(h.Key, keyW))+
+				styleInfo.Render(truncPlain(h.Desc, descW)))
+		}
+	}
+	return lines
+}
+
+// renderHelp renders the scrollable help overlay as a centered modal. The
+// visible window is derived from terminal height; ↑/↓ scroll (handled in
+// handleKey), esc/ctrl+g/q closes.
+func (m *model) renderHelp(w int) string {
+	lines := m.helpLines(w)
+	total := len(lines)
+
+	maxRows := m.height - 8
+	if maxRows < 6 {
+		maxRows = 6
+	}
+
+	// Clamp scroll to the valid range (guards against height changes).
+	maxScroll := max(0, total-maxRows)
+	if m.helpScroll < 0 {
+		m.helpScroll = 0
+	}
+	if m.helpScroll > maxScroll {
+		m.helpScroll = maxScroll
+	}
+
+	end := min(total, m.helpScroll+maxRows)
+	view := lines[m.helpScroll:end]
+
+	hint := "esc or ctrl+g closes"
+	if total > maxRows {
+		hint = fmt.Sprintf("↑/↓ scroll · esc closes (%d–%d/%d)", m.helpScroll+1, end, total)
+	}
+	return dialogBox("help", hint, strings.Join(view, "\n"), w)
+}
+
+// padRight right-pads s with spaces to at least n runes (no truncation).
+func padRight(s string, n int) string {
+	r := []rune(s)
+	if len(r) >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-len(r))
+}
+
+// truncPlain truncates unstyled text to max runes, appending "…" when cut.
+func truncPlain(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max < 1 {
+		max = 1
+	}
+	return string(r[:max-1]) + "…"
 }
 
 // renderModal renders the head pending_approvals item as an allow/deny

@@ -18,6 +18,8 @@ import (
 const (
 	toolBodyCollapsedLines = 3
 	toolBodyExpandedLines  = 30
+	// diffContextLines caps the dimmed shared lines shown around a change.
+	diffContextLines = 3
 )
 
 // humanizeToolName turns snake/camel tool ids into display names.
@@ -259,51 +261,48 @@ func (m *model) renderBashTool(l *protocol.TranscriptLine, w int) string {
 	return strings.Join(out, "\n")
 }
 
-// renderWriteTool renders a file write tool with summary and content preview.
+// renderWriteTool renders a file write tool with a "＋ Wrote N lines" summary
+// and an all-added content preview whose green background spans the card.
 func (m *model) renderWriteTool(l *protocol.TranscriptLine, w int) string {
 	var args map[string]any
 	_ = json.Unmarshal([]byte(l.ArgsText), &args)
-	path := ""
-	if p, ok := args["file_path"].(string); ok && p != "" {
-		path = p
-	} else if p, ok := args["path"].(string); ok && p != "" {
-		path = p
+	path := str(args["file_path"])
+	if path == "" {
+		path = str(args["path"])
 	}
-
-	content := ""
-	if c, ok := args["content"].(string); ok {
-		content = c
-	}
+	content := str(args["content"])
 
 	bodyW := max(10, w-4)
 	var out []string
 
-	// Summary line.
+	// Summary line: "＋ Wrote N lines to <path>" (trailing newline not counted).
 	lines := strings.Split(content, "\n")
 	lineCount := len(lines)
 	if lineCount > 0 && lines[len(lines)-1] == "" {
 		lineCount--
 	}
 	if path != "" {
-		out = append(out, styleToolName.Render(fmt.Sprintf("Wrote %d lines to %s", lineCount, path)))
+		plus := lipgloss.NewStyle().Foreground(theme.OK).Bold(true).Render("＋")
+		out = append(out, plus+" "+styleToolName.Render(fmt.Sprintf("Wrote %d lines to %s", lineCount, path)))
 	}
 
-	// Content preview (first few lines).
+	// Content preview (first few lines), dropping a trailing empty line.
+	preview := lines
+	if len(preview) > 0 && preview[len(preview)-1] == "" {
+		preview = preview[:len(preview)-1]
+	}
 	maxLines := toolBodyCollapsedLines
 	if m.showToolOutput {
 		maxLines = toolBodyExpandedLines
 	}
-	shown := lines
-	if len(lines) > maxLines {
-		shown = lines[:maxLines]
+	shown := preview
+	if len(preview) > maxLines {
+		shown = preview[:maxLines]
 	}
 	for _, ln := range shown {
-		if lipgloss.Width(ln) > bodyW {
-			ln = compactOneLine(ln, bodyW)
-		}
-		out = append(out, styleDiffAdd.Render("+ "+ln))
+		out = append(out, diffRow(styleDiffAdd, "+ ", ln, bodyW))
 	}
-	if n := len(lines) - len(shown); n > 0 {
+	if n := len(preview) - len(shown); n > 0 {
 		hint := "ctrl+o expands"
 		if m.showToolOutput {
 			hint = "output capped"
@@ -450,8 +449,10 @@ func (m *model) renderGenericToolBody(l *protocol.TranscriptLine, w int) string 
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderEditDiff builds a colored +/- diff for Edit/Write/MultiEdit tool cards
-// from the tool arguments (old_string→new_string, or content for Write).
+// renderEditDiff builds a unified-style +/- diff for Edit/MultiEdit tool cards
+// from the tool arguments (old_string→new_string). Shared leading/trailing
+// lines show dimmed as context; only the changed lines wear +/- and a tinted
+// full-width background.
 func (m *model) renderEditDiff(l *protocol.TranscriptLine, w int) string {
 	if l.ArgsText == "" {
 		return ""
@@ -476,26 +477,19 @@ func (m *model) renderEditDiff(l *protocol.TranscriptLine, w int) string {
 	default:
 		return ""
 	}
-	maxLines := toolBodyCollapsedLines
-	if m.showToolOutput {
-		maxLines = toolBodyExpandedLines
-	}
+
 	bodyW := max(10, w-4)
 	var out []string
 	for _, e := range edits {
-		if e.oldS != "" {
-			for _, ln := range strings.Split(strings.TrimRight(e.oldS, "\n"), "\n") {
-				out = append(out, styleDiffRemove.Render("- "+compactOneLine(ln, bodyW)))
-			}
-		}
-		if e.newS != "" {
-			for _, ln := range strings.Split(strings.TrimRight(e.newS, "\n"), "\n") {
-				out = append(out, styleDiffAdd.Render("+ "+compactOneLine(ln, bodyW)))
-			}
-		}
+		out = append(out, diffEdit(e.oldS, e.newS, bodyW)...)
 	}
 	if len(out) == 0 {
 		return ""
+	}
+
+	maxLines := toolBodyCollapsedLines
+	if m.showToolOutput {
+		maxLines = toolBodyExpandedLines
 	}
 	shown := out
 	if len(out) > maxLines {
@@ -510,6 +504,158 @@ func (m *model) renderEditDiff(l *protocol.TranscriptLine, w int) string {
 		res += "\n" + styleToolBody.Render(fmt.Sprintf("… +%d lines (%s)", n, hint))
 	}
 	return res
+}
+
+// diffEdit turns one old→new change into unified-diff rows: a few dimmed
+// context lines around the change, removed lines prefixed "-", added lines
+// prefixed "+". A clean single-line change gets word-level emphasis.
+func diffEdit(oldS, newS string, bodyW int) []string {
+	oldL := splitDiffLines(oldS)
+	newL := splitDiffLines(newS)
+
+	// Longest common prefix / suffix at line granularity → context.
+	i := 0
+	for i < len(oldL) && i < len(newL) && oldL[i] == newL[i] {
+		i++
+	}
+	j := 0
+	for j < len(oldL)-i && j < len(newL)-i && oldL[len(oldL)-1-j] == newL[len(newL)-1-j] {
+		j++
+	}
+	lead := oldL[:i]
+	del := oldL[i : len(oldL)-j]
+	add := newL[i : len(newL)-j]
+	var tail []string
+	if j > 0 {
+		tail = oldL[len(oldL)-j:]
+	}
+
+	var out []string
+	for _, ln := range lastN(lead, diffContextLines) {
+		out = append(out, diffRow(styleDiffCtx, "  ", ln, bodyW))
+	}
+
+	// Single-line replacement → word-level emphasis when it fits cleanly.
+	if len(del) == 1 && len(add) == 1 {
+		if d, a, ok := diffRowsEmph(del[0], add[0], bodyW); ok {
+			out = append(out, d, a)
+		} else {
+			out = append(out, diffRow(styleDiffRemove, "- ", del[0], bodyW))
+			out = append(out, diffRow(styleDiffAdd, "+ ", add[0], bodyW))
+		}
+	} else {
+		for _, ln := range del {
+			out = append(out, diffRow(styleDiffRemove, "- ", ln, bodyW))
+		}
+		for _, ln := range add {
+			out = append(out, diffRow(styleDiffAdd, "+ ", ln, bodyW))
+		}
+	}
+
+	for _, ln := range firstN(tail, diffContextLines) {
+		out = append(out, diffRow(styleDiffCtx, "  ", ln, bodyW))
+	}
+	return out
+}
+
+// diffRow renders one full-width diff row: prefix + truncated text, padded
+// with spaces so the style's background spans the whole card width.
+func diffRow(style lipgloss.Style, prefix, text string, bodyW int) string {
+	text = truncCell(text, max(1, bodyW-lipgloss.Width(prefix)))
+	line := prefix + text
+	if pad := bodyW - lipgloss.Width(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return style.Render(line)
+}
+
+// diffRowsEmph renders a single-line change with the differing middle segment
+// emphasized (bold+underline). It bails (ok=false) when the lines would need
+// truncation or differ entirely, so the caller can fall back to plain rows.
+func diffRowsEmph(oldLine, newLine string, bodyW int) (string, string, bool) {
+	ol := strings.ReplaceAll(oldLine, "\t", "    ")
+	nl := strings.ReplaceAll(newLine, "\t", "    ")
+	if lipgloss.Width(ol)+2 > bodyW || lipgloss.Width(nl)+2 > bodyW {
+		return "", "", false
+	}
+	or := []rune(ol)
+	nr := []rune(nl)
+	p := 0
+	for p < len(or) && p < len(nr) && or[p] == nr[p] {
+		p++
+	}
+	s := 0
+	for s < len(or)-p && s < len(nr)-p && or[len(or)-1-s] == nr[len(nr)-1-s] {
+		s++
+	}
+	// No shared context → emphasis adds nothing; let the caller do plain rows.
+	if p == 0 && s == 0 {
+		return "", "", false
+	}
+
+	build := func(base lipgloss.Style, prefix, pre, mid, suf string) string {
+		content := prefix + pre + mid + suf
+		tailPad := ""
+		if pad := bodyW - lipgloss.Width(content); pad > 0 {
+			tailPad = strings.Repeat(" ", pad)
+		}
+		emph := base.Bold(true).Underline(true)
+		var b strings.Builder
+		b.WriteString(base.Render(prefix + pre))
+		if mid != "" {
+			b.WriteString(emph.Render(mid))
+		}
+		b.WriteString(base.Render(suf + tailPad))
+		return b.String()
+	}
+
+	delRow := build(styleDiffRemove, "- ",
+		string(or[:p]), string(or[p:len(or)-s]), string(or[len(or)-s:]))
+	addRow := build(styleDiffAdd, "+ ",
+		string(nr[:p]), string(nr[p:len(nr)-s]), string(nr[len(nr)-s:]))
+	return delRow, addRow, true
+}
+
+// splitDiffLines splits into lines, dropping a single trailing newline, and
+// returns nil for empty input (so pure insertions/deletions have no lines).
+func splitDiffLines(s string) []string {
+	s = strings.TrimRight(s, "\n")
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
+}
+
+// truncCell truncates s to display width w (ellipsis when cut), expanding tabs
+// but preserving leading indentation — unlike compactOneLine, which collapses
+// whitespace and would flatten code structure in diffs.
+func truncCell(s string, w int) string {
+	s = strings.ReplaceAll(s, "\t", "    ")
+	if w < 1 {
+		w = 1
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > w {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
+}
+
+func firstN(s []string, n int) []string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+func lastN(s []string, n int) []string {
+	if len(s) > n {
+		return s[len(s)-n:]
+	}
+	return s
 }
 
 // str coerces a JSON value to a string (empty for non-strings/nil).

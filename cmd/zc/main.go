@@ -110,6 +110,7 @@ type model struct {
 	spinning       bool
 	helpModel      help.Model
 	showHelp       bool
+	helpScroll     int // scroll offset in the help overlay
 	showReasoning  bool
 	showToolOutput bool
 
@@ -936,6 +937,15 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+g", "q":
 			m.showHelp = false
+			m.helpScroll = 0
+		case "up", "ctrl+p", "k":
+			m.helpScroll--
+		case "down", "ctrl+n", "j":
+			m.helpScroll++
+		case "pgup", "ctrl+u":
+			m.helpScroll -= 10
+		case "pgdown", "ctrl+d":
+			m.helpScroll += 10
 		}
 		return m, nil
 	}
@@ -954,6 +964,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleCtrlC()
 	case key.Matches(msg, keys.Help):
 		m.showHelp = true
+		m.helpScroll = 0
 		return m, nil
 	case key.Matches(msg, keys.Mode):
 		return m.cycleMode()
@@ -1402,7 +1413,14 @@ func (m *model) renderLine(l *protocol.TranscriptLine, w int) string {
 	wrap := lipgloss.NewStyle().Width(w)
 	switch l.Kind {
 	case "user":
-		return wrap.Render(rail(theme.User) + styleUser.Render("you ▸ ") + l.Text)
+		// Subtle full-width background highlight: pad the line to width w so the
+		// background extends the full row. Keep the "you ▸" rail + prefix.
+		bg := styleUserBgLight
+		if m.isDark {
+			bg = styleUserBgDark
+		}
+		content := rail(theme.User) + styleUser.Render("you ▸ ") + l.Text
+		return bg.Width(w).Render(content)
 
 	case "assistant":
 		var md string
@@ -1475,7 +1493,7 @@ func (m *model) renderLine(l *protocol.TranscriptLine, w int) string {
 			"✦ %s · %d steps · %.1fs", l.Verb, l.StepCount, l.DurationMs/1000)))
 
 	case "separator":
-		return styleInfo.Render(strings.Repeat("─", max(4, min(w, 60))))
+		return styleInfo.Render(strings.Repeat("─", max(4, min(w, 80))))
 
 	case "error":
 		return wrap.Render(styleError.Render("✕ " + l.Text))
@@ -1935,6 +1953,7 @@ func main() {
 	}
 
 	m := newModel(cli, logPath, opts)
+	m.isDark = isDark
 	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
