@@ -103,6 +103,15 @@ type model struct {
 	selection *overlay
 	selQ      *selectionQuestions
 
+	// "@" file-path completion popup (resolved against serverCWD)
+	complete    *overlay
+	completeTok string // the "@partial" token currently being completed
+
+	// client-side paste registry: large pastes are stashed here and shown as
+	// "[Pasted text #N +M lines]" placeholders, resolved on submit.
+	pastes   map[string]string
+	pasteSeq int
+
 	// chat UI
 	list           *list.List
 	input          textarea.Model
@@ -316,8 +325,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.PasteMsg:
-		if m.st.phase == "chat" {
-			m.cli.Send(protocol.NewInputPaste(msg.Content))
+		// Large pastes become a client-side placeholder; small pastes insert
+		// inline. Nothing goes to the server until submit (see handleSubmit).
+		if m.st.phase == "chat" && m.palette == nil && m.selection == nil &&
+			m.question == nil && len(m.st.pendingApprovals) == 0 {
+			m.handlePaste(msg.Content)
+			m.refreshCompletion()
 		}
 		return m, nil
 
@@ -933,6 +946,10 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if len(m.st.pendingApprovals) > 0 {
 		return m.handleApprovalKey(msg)
 	}
+	// "@" file-path completion popup intercepts navigation/commit keys.
+	if m.complete != nil {
+		return m.handleCompleteKey(msg)
+	}
 	if m.showHelp {
 		switch msg.String() {
 		case "esc", "ctrl+g", "q":
@@ -1035,6 +1052,8 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	m.autosize()
+	// Re-evaluate the "@" completion popup after any content keystroke.
+	m.refreshCompletion()
 	return m, cmd
 }
 
@@ -1092,10 +1111,15 @@ func (m *model) handleSubmit() (tea.Model, tea.Cmd) {
 	if strings.TrimSpace(text) == "" {
 		return m, nil
 	}
-	m.cli.Send(protocol.NewInputSubmit(text))
+	// Resolve any paste placeholders back to their full stored content before
+	// sending, then drop the registry.
+	resolved := m.resolvePastes(text)
+	m.cli.Send(protocol.NewInputSubmit(resolved))
+	m.clearPastes()
+	m.complete = nil
 	// Deduplicate: don't add an identical consecutive entry (native behavior).
-	if len(m.history) == 0 || m.history[len(m.history)-1] != text {
-		m.history = append(m.history, text)
+	if len(m.history) == 0 || m.history[len(m.history)-1] != resolved {
+		m.history = append(m.history, resolved)
 	}
 	m.historyIdx = len(m.history)
 	m.historyDraft = ""
@@ -1885,6 +1909,18 @@ func (m *model) viewContent() string {
 		parts = append(parts, below)
 	}
 	base := strings.Join(parts, "\n")
+
+	// "@" completion popup: a floating list anchored just above the input,
+	// rather than a centered modal (it accompanies live typing).
+	if m.complete != nil {
+		w := min(m.width-4, 72)
+		if w < 20 {
+			w = 20
+		}
+		box := m.complete.render(w, 12)
+		y := m.height - m.extraHeight() - 1 - lipgloss.Height(box)
+		return compositeAt(base, box, 2, y)
+	}
 
 	if box := m.activeDialog(); box != "" {
 		return compositeDialog(base, box, m.width, m.height)
