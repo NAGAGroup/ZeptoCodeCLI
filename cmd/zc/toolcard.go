@@ -147,7 +147,12 @@ func (m *model) renderToolCard(l *protocol.TranscriptLine, w int) string {
 		icon = styleToolErr.Render(iconToolErr)
 		suffix = "  " + styleToolErr.Render("error")
 	default: // running / streaming args
-		icon = styleTool.Render(iconToolPending)
+		if m.isExecuting(l) {
+			icon = styleAccent.Render("▸")
+			suffix = "  " + styleAccent.Render("running")
+		} else {
+			icon = styleTool.Render(iconToolPending)
+		}
 	}
 	header := fmt.Sprintf("%s %s %s%s", icon, nameStyle.Render(name), styleToolParam.Render(params), suffix)
 

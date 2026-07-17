@@ -1054,9 +1054,23 @@ func (m *model) lineCacheKey(l *protocol.TranscriptLine) string {
 	if l.Streaming != nil {
 		sc = l.Streaming.TotalLineCount
 	}
-	return fmt.Sprintf("%s|%d|%d|%d|%s|%s|%s|%d|%v|%v",
+	return fmt.Sprintf("%s|%d|%d|%d|%s|%s|%s|%d|%v|%v|%v",
 		l.Kind, len(l.Text), len(l.ResultText), len(l.Output),
-		l.Phase, ok, success, sc, m.showReasoning, m.showToolOutput)
+		l.Phase, ok, success, sc, m.showReasoning, m.showToolOutput, m.isExecuting(l))
+}
+
+// isExecuting reports whether a tool_call line is currently running client-side
+// (its id is in the turn's executing_tool_call_ids).
+func (m *model) isExecuting(l *protocol.TranscriptLine) bool {
+	if l.Kind != "tool_call" || len(m.st.turn.ExecutingToolCallIDs) == 0 {
+		return false
+	}
+	for _, id := range m.st.turn.ExecutingToolCallIDs {
+		if id == l.ID {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *model) renderLine(l *protocol.TranscriptLine, w int) string {
@@ -1188,6 +1202,21 @@ func formatK(n int) string {
 // ── statusline & activity ──
 
 func turnVerb(t protocol.TurnState) string {
+	// Prefer the native ExecutionPhase (distinct spinner text per phase); the
+	// rotating thinking_message enriches "thinking".
+	switch t.Phase {
+	case "requesting":
+		return "requesting"
+	case "thinking":
+		if t.ThinkingMessage != "" {
+			return strings.TrimPrefix(t.ThinkingMessage, "is ") // "processing", "thinking"…
+		}
+		return "thinking"
+	case "toolUse":
+		return "running tool"
+	case "responding":
+		return "responding"
+	}
 	switch t.Status {
 	case "sending":
 		return "sending"
@@ -1211,6 +1240,15 @@ func turnVerb(t protocol.TurnState) string {
 
 func (m *model) statusline() string {
 	status := turnVerb(m.st.turn)
+	// Native NetworkPhase indicator (upload/download/error).
+	switch m.st.turn.Network {
+	case "upload":
+		status = "↑ " + status
+	case "download":
+		status = "↓ " + status
+	case "error":
+		status = "⚠ " + status
+	}
 	if m.turnActive() {
 		status = m.spin.View() + " " + styleAccent.Render(status)
 	} else {

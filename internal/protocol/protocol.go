@@ -107,8 +107,16 @@ type Transcript struct {
 type TurnState struct {
 	Type       string `json:"type"`
 	Status     string `json:"status"` // idle|sending|thinking|streaming|executing_tool|waiting_on_approval|cancelling
-	StopReason string `json:"stop_reason,omitempty"`
-	Error      string `json:"error,omitempty"`
+	// Native ExecutionPhase (spinner visual): requesting|thinking|toolUse|responding.
+	Phase string `json:"phase,omitempty"`
+	// Native NetworkPhase: error|upload|download.
+	Network string `json:"network,omitempty"`
+	// Rotating themed thinking verb (e.g. "is processing").
+	ThinkingMessage string `json:"thinking_message,omitempty"`
+	// Tool call ids executing client-side (highlight the live cards).
+	ExecutingToolCallIDs []string `json:"executing_tool_call_ids,omitempty"`
+	StopReason           string   `json:"stop_reason,omitempty"`
+	Error                string   `json:"error,omitempty"`
 }
 
 // Active reports whether the turn is non-idle (spinner / interrupt armed).
