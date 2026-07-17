@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1254,6 +1255,16 @@ func (m *model) renderShellOutput(out string, w int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func formatK(n int) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	}
+	return strconv.Itoa(n)
+}
+
 // ── statusline & activity ──
 
 func turnVerb(t protocol.TurnState) string {
@@ -1310,6 +1321,10 @@ func (m *model) statusline() string {
 		left += styleAccent.Render("◇ "+md) + " "
 	}
 	left += status
+	if m.st.device != nil && m.st.device.Usage != nil {
+		u := m.st.device.Usage
+		left += styleInfo.Render(fmt.Sprintf(" · %s", formatK(u.TotalTokens)))
+	}
 
 	right := styleInfo.Render("esc interrupt · shift+tab mode · ^g help ")
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)

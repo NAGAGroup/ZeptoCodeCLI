@@ -72,6 +72,14 @@ type DeviceConversation struct {
 	Title string `json:"title,omitempty"`
 }
 
+// DeviceUsage carries token/cost counters for the statusline.
+type DeviceUsage struct {
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd,omitempty"`
+}
+
 // DeviceState is ambient status the statusline/header renders from.
 type DeviceState struct {
 	Type           string             `json:"type"`
@@ -83,6 +91,7 @@ type DeviceState struct {
 	Toolset        []string           `json:"toolset"`
 	LettaCodeVer   string             `json:"letta_code_version"`
 	ShouldDoctor   bool               `json:"should_doctor,omitempty"`
+	Usage          *DeviceUsage       `json:"usage,omitempty"`
 }
 
 // Transcript carries the whole transcript as the native Line[] every push.
