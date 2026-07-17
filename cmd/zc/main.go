@@ -807,6 +807,10 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.selection != nil {
 		return m.handleSelectionKey(msg)
 	}
+	if m.picker != nil {
+		// In-chat agent/conversation switch reuses the lobby picker.
+		return m.handlePickerKey(msg)
+	}
 	if m.question != nil {
 		return m.handleQuestionKey(msg)
 	}
