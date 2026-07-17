@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -990,8 +991,13 @@ func (m *model) autosize() {
 
 func (m *model) extraHeight() int {
 	h := 2 // input border
-	if act := m.activityLines(); act != "" {
-		h += lipgloss.Height(act)
+	for _, s := range []string{
+		m.panelsAboveInput(), m.toastLines(), m.panelsProductStatus(),
+		m.panelsPrimary(), m.panelsBelowPrimary(),
+	} {
+		if s != "" {
+			h += lipgloss.Height(s)
+		}
 	}
 	return h
 }
@@ -1255,15 +1261,41 @@ func shortModel(handle string) string {
 	return handle
 }
 
-// activityLines renders mod-panel lines + transient toasts between the
-// transcript and the input.
-func (m *model) activityLines() string {
-	var lines []string
+// panelLinesInRange collects mod-panel lines whose order matches pred, sorted
+// so the highest order renders first (native: highest panel at the top).
+func (m *model) panelLinesInRange(pred func(order int) bool) string {
+	type pnl struct {
+		order int
+		lines []string
+	}
+	var sel []pnl
 	for _, p := range m.st.modPanels {
-		for _, ln := range p.Lines {
-			lines = append(lines, ln)
+		if pred(p.Order) && len(p.Lines) > 0 {
+			sel = append(sel, pnl{p.Order, p.Lines})
 		}
 	}
+	sort.SliceStable(sel, func(i, j int) bool { return sel[i].order > sel[j].order })
+	var lines []string
+	for _, p := range sel {
+		lines = append(lines, p.lines...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Native openPanel placement (deprecated-api.ts:11 / types.ts:485):
+//
+//	order > 1  → additive panels ABOVE the input (highest at top)
+//	order == 1 → replaces the product-status row (just under the input)
+//	order == 0 → the primary line (overrides the built-in agent·model statusline)
+//	order < 0  → stacks BELOW the primary line
+func (m *model) panelsAboveInput() string    { return m.panelLinesInRange(func(o int) bool { return o > 1 }) }
+func (m *model) panelsProductStatus() string { return m.panelLinesInRange(func(o int) bool { return o == 1 }) }
+func (m *model) panelsPrimary() string       { return m.panelLinesInRange(func(o int) bool { return o == 0 }) }
+func (m *model) panelsBelowPrimary() string  { return m.panelLinesInRange(func(o int) bool { return o < 0 }) }
+
+// toastLines renders transient toasts (separate from mod panels) above the input.
+func (m *model) toastLines() string {
+	var lines []string
 	for _, t := range m.st.toasts {
 		style := styleInfo
 		switch t.level {
@@ -1325,8 +1357,12 @@ func (m *model) viewContent() string {
 	}
 
 	parts := []string{m.list.View()}
-	if act := m.activityLines(); act != "" {
-		parts = append(parts, act)
+	// Panels with order > 1 render above the input; transient toasts too.
+	if above := m.panelsAboveInput(); above != "" {
+		parts = append(parts, above)
+	}
+	if tl := m.toastLines(); tl != "" {
+		parts = append(parts, tl)
 	}
 	inputBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1334,7 +1370,20 @@ func (m *model) viewContent() string {
 		Width(m.width - 2).
 		Render(m.input.View())
 	parts = append(parts, inputBox)
-	parts = append(parts, m.statusline())
+	// order == 1 replaces the product-status row (just under the input).
+	if ps := m.panelsProductStatus(); ps != "" {
+		parts = append(parts, ps)
+	}
+	// order == 0 overrides the built-in agent·model statusline; else default.
+	if prim := m.panelsPrimary(); prim != "" {
+		parts = append(parts, prim)
+	} else {
+		parts = append(parts, m.statusline())
+	}
+	// order < 0 stacks below the primary line.
+	if below := m.panelsBelowPrimary(); below != "" {
+		parts = append(parts, below)
+	}
 	base := strings.Join(parts, "\n")
 
 	if box := m.activeDialog(); box != "" {
