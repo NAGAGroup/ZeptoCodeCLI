@@ -569,6 +569,25 @@ func NewExecuteCommand(commandID string) ExecuteCommand {
 	return ExecuteCommand{Type: "execute_command", CommandID: commandID}
 }
 
+// AgentsQuery asks the server to push the agents list.
+type AgentsQuery struct {
+	Type string `json:"type"`
+}
+
+func NewAgentsQuery() AgentsQuery {
+	return AgentsQuery{Type: "agents_query"}
+}
+
+// ConversationsQuery asks the server to push conversations for an agent.
+type ConversationsQuery struct {
+	Type    string `json:"type"`
+	AgentID string `json:"agent_id,omitempty"`
+}
+
+func NewConversationsQuery(agentID string) ConversationsQuery {
+	return ConversationsQuery{Type: "conversations_query", AgentID: agentID}
+}
+
 // SelectionChoice is the committed result of a tagged selection (SPEC R23).
 // The Tag (echoed from the Selection) tells the server how to dispatch.
 type SelectionChoice struct {

@@ -363,14 +363,15 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 
 	case *protocol.Agents:
 		m.st.agents = fr.Items
-		if m.st.phase == "lobby" {
+		// Open in lobby (startup) and in chat (ctrl+a switch).
+		if m.st.phase == "lobby" || m.st.phase == "chat" {
 			m.openAgentPicker()
 		}
 
 	case *protocol.Conversations:
 		m.st.conversations = fr.Items
 		m.st.selectedAgentID = fr.AgentID
-		if m.st.phase == "lobby" {
+		if m.st.phase == "lobby" || m.st.phase == "chat" {
 			m.openConversationPicker()
 		}
 
@@ -837,6 +838,12 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case key.Matches(msg, keys.Mode):
 		return m.cycleMode()
+	case key.Matches(msg, keys.Agents):
+		m.cli.Send(protocol.NewAgentsQuery())
+		return m, nil
+	case key.Matches(msg, keys.Conversations):
+		m.cli.Send(protocol.NewConversationsQuery(""))
+		return m, nil
 	case key.Matches(msg, keys.ClearOrAbort):
 		return m.handleEsc()
 	case key.Matches(msg, keys.Send):
