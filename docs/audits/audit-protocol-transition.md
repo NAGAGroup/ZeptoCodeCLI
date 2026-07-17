@@ -128,3 +128,28 @@ Handled server-side via native helpers (EXISTS/verified): `/context` (`renderCon
 should NOT mirror it in-process. `/sleeptime` uses the native reflection
 persistence helper (correct logic; only the selector UX degrades to text).
 Client-local input state correctly stays off the wire.
+
+---
+
+## Implementation status (2026-07-17)
+
+- **Statusline/panel API (openPanel)** ✅ — server evaluates mod panels with
+  `order`, client places them by native slots (>1 above input, 1 product-status,
+  0 primary override, <0 below). muscle-memory (order 20) verified rendering.
+  Fix: `mod_panels.owner` must be a string (object broke Go decode).
+- **Tier A #1 turn frame** ✅ — `turn` now carries `phase`
+  (requesting/thinking/toolUse/responding), `network` (upload/download/error),
+  `thinking_message`, `executing_tool_call_ids`. Client renders phase spinner
+  verb, network glyph, and highlights the live tool card.
+- **Tier A #2 context readout** ✅ — `device.usage` carries `context_tokens` +
+  `context_window`; statusline shows `NNk/NNNk (NN%)`.
+- **Tier B #3 queue** ✅ — `queue` frame; mid-turn messages enqueue (visible),
+  drain one-per-turn after; `queue_defer_set` toggles the defer indicator.
+- **Tier B #4 commands** ✅ — `/toolset`, `/experiments`, `/btw` (hidden fork).
+- **Tier C** — focus-aware turn-complete notification (OSC9+bell) ✅;
+  `/sleeptime` now a selection overlay ✅; subagent activity in statusline ✅.
+
+**Remaining (small / by-design):** `/connect` stays a text command (secure
+API-key entry needs a masked form — bigger lift; text works); `conversationSummary`
+(zc uses a bottom statusline by design, not a right sidebar); elapsed/trajectory
+stats (minor). Everything else in the audit is implemented.
