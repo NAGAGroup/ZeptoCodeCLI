@@ -561,6 +561,17 @@ func NewChangeMode(mode PermissionMode) ChangeMode {
 	return ChangeMode{Type: "change_mode", PermissionMode: mode}
 }
 
+// SessionEvent reports lifecycle events (conversation_open/close, session_start/end).
+type SessionEvent struct {
+	Type       string `json:"type"`
+	Event      string `json:"event"`
+	DurationMs int    `json:"duration_ms,omitempty"`
+}
+
+func NewSessionEvent(event string) SessionEvent {
+	return SessionEvent{Type: "session_event", Event: event}
+}
+
 // ChangeCwd sets the working directory.
 type ChangeCwd struct {
 	Type string `json:"type"`
