@@ -9,6 +9,11 @@
 // many of its lines are scrolled above the window. A follow flag keeps the
 // view pinned to the bottom while streaming, and any upward scroll
 // releases it.
+//
+// Frozen items: items whose CacheKey() returns "" are considered frozen
+// (never re-rendered). Their memoized lines are kept forever and their
+// height is not recomputed. This allows finished transcript items to be
+// cached permanently while only live items re-render.
 package list
 
 import "strings"
@@ -21,6 +26,8 @@ type Item interface {
 	Render(width int) string
 	// CacheKey is the invalidation key: when it changes (or the width
 	// does), the memoized render and height for this item are dropped.
+	// If CacheKey returns "" the item is considered FROZEN: its render
+	// is memoized forever and never recomputed.
 	CacheKey() string
 }
 
@@ -28,6 +35,7 @@ type cacheEnt struct {
 	width int
 	key   string
 	lines []string
+	frozen bool // never re-rendered
 }
 
 // List renders a vertical stack of items into a fixed-size window.
@@ -49,10 +57,15 @@ func New() *List {
 	return &List{follow: true, gap: 1, cache: map[Item]*cacheEnt{}}
 }
 
-// SetSize sets the window size. Width changes drop the render cache.
+// SetSize sets the window size. Width changes drop the render cache for
+// non-frozen items.
 func (l *List) SetSize(width, height int) {
 	if width != l.width {
-		l.cache = map[Item]*cacheEnt{}
+		for it, ent := range l.cache {
+			if !ent.frozen {
+				delete(l.cache, it)
+			}
+		}
 	}
 	l.width = width
 	l.height = height
@@ -98,12 +111,14 @@ func (l *List) Len() int { return len(l.items) }
 func (l *List) lines(i int) []string {
 	it := l.items[i]
 	key := it.CacheKey()
-	if ent, ok := l.cache[it]; ok && ent.width == l.width && ent.key == key {
-		return ent.lines
+	if ent, ok := l.cache[it]; ok && ent.width == l.width {
+		if ent.frozen || ent.key == key {
+			return ent.lines
+		}
 	}
 	rendered := it.Render(l.width)
 	lines := strings.Split(rendered, "\n")
-	l.cache[it] = &cacheEnt{width: l.width, key: key, lines: lines}
+	l.cache[it] = &cacheEnt{width: l.width, key: key, lines: lines, frozen: key == ""}
 	return lines
 }
 

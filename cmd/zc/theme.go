@@ -74,6 +74,9 @@ func initTheme(isDark bool) {
 	styleStatus = lipgloss.NewStyle().Foreground(theme.Text).Faint(true)
 	styleStatusMode = lipgloss.NewStyle().Bold(true)
 
+	styleBYOKOpenAI = lipgloss.NewStyle().Foreground(theme.OK)     // green ▲
+	styleBYOKOther  = lipgloss.NewStyle().Foreground(theme.Warn)   // yellow ▲
+
 	styleModal = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Tool).Padding(0, 1)
 
@@ -84,6 +87,16 @@ func initTheme(isDark bool) {
 	styleDiffRemove = lipgloss.NewStyle().Foreground(ld(charmtone.Sriracha, charmtone.Cherry)).
 		Background(ld(lipgloss.Color("#fbeaea"), charmtone.Toast))
 	styleDiffCtx = lipgloss.NewStyle().Foreground(theme.Dim)
+
+	// Tool phase indicator styles.
+	styleToolPhaseStreaming = lipgloss.NewStyle().Foreground(theme.Dim)
+	styleToolPhaseRunning     = lipgloss.NewStyle().Foreground(theme.Accent)
+	styleToolPhaseSuccess     = lipgloss.NewStyle().Foreground(theme.OK)
+	styleToolPhaseError       = lipgloss.NewStyle().Foreground(theme.Danger)
+
+	// Subtle full-width backgrounds for user messages (12% white on dark, 4% black on light).
+	styleUserBgDark  = lipgloss.NewStyle().Background(lipgloss.Color("#1f1f1f"))
+	styleUserBgLight = lipgloss.NewStyle().Background(lipgloss.Color("#f5f5f5"))
 
 	styleModePill = lipgloss.NewStyle().Bold(true).Padding(0, 1).
 		Foreground(ld(charmtone.Salt, charmtone.Pepper))
@@ -138,6 +151,9 @@ var (
 	styleStatus     lipgloss.Style
 	styleStatusMode lipgloss.Style
 
+	styleBYOKOpenAI lipgloss.Style
+	styleBYOKOther  lipgloss.Style
+
 	styleModal lipgloss.Style
 
 	styleDiffAdd    lipgloss.Style
@@ -153,6 +169,14 @@ var (
 
 	styleCompletion    lipgloss.Style
 	styleCompletionSel lipgloss.Style
+
+	styleToolPhaseStreaming lipgloss.Style
+	styleToolPhaseRunning   lipgloss.Style
+	styleToolPhaseSuccess   lipgloss.Style
+	styleToolPhaseError     lipgloss.Style
+
+	styleUserBgDark  lipgloss.Style
+	styleUserBgLight lipgloss.Style
 
 	lipglossStyleKey lipgloss.Style
 )

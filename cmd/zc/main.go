@@ -48,6 +48,13 @@ type toast struct {
 	expire time.Time
 }
 
+// statusHint is an ephemeral hint shown in the statusline area.
+type statusHint struct {
+	text   string
+	level  string // info | warning | error
+	expire time.Time
+}
+
 // State is the held copy of the server-pushed state. Update mutates it; View
 // renders from it. Every field maps to exactly one server frame (SPEC §4).
 type State struct {
@@ -67,6 +74,7 @@ type State struct {
 	pendingApprovals []protocol.PendingApproval
 	modPanels        []protocol.ModPanel
 	toasts           []toast
+	statusHint       *statusHint
 	convID           string
 
 	// handshake info
@@ -122,6 +130,10 @@ type model struct {
 	agentName   string
 	convTitle   string
 	modelHandle string
+	isDark      bool // for user message background selection
+
+	// token smoothing display
+	displayTokens int
 
 	// input history recall
 	history    []string
@@ -132,6 +144,25 @@ type model struct {
 	focused      bool
 	approvalSel  int // cursor in the numbered approval options
 	startOpts    client.Options
+
+	// approval UX: custom deny input + memoized modal content
+	denyText                   string
+	approvalModalCacheKey      string
+	approvalModalCachedContent string
+
+	// approval UX: stubs for sequential approvals (id -> decision)
+	decidedApprovals map[string]decidedApproval
+
+	// transient hint tracking
+	lastQueueDeferred bool
+	lastBashCount     int
+}
+
+// decidedApproval tracks a user decision before the server removes it from
+// pending_approvals. Used to render "queued" stubs in the transcript area.
+type decidedApproval struct {
+	decision string // "allow" | "deny"
+	toolName string
 }
 
 // ── tea messages ──
@@ -140,6 +171,7 @@ type framesMsg struct{ frames []any }
 type disconnectedMsg struct{}
 type toastTickMsg struct{}
 type modPanelTickMsg struct{}
+type hintTickMsg struct{}
 
 // waitForFrame blocks for one frame then drains everything already queued so
 // heavy streams collapse into one render per batch. The read loop never drops
@@ -197,6 +229,7 @@ func newModel(cli *client.Client, logPath string, opts client.Options) *model {
 		mode:        "?",
 		focused:     true,
 		startOpts:   opts,
+		decidedApprovals: map[string]decidedApproval{},
 	}
 }
 
@@ -206,17 +239,25 @@ func (m *model) Init() tea.Cmd {
 
 // ── list adapter: one transcript Line rendered lazily & memoized ──
 
+// lineItem is one transcript entry in the list.
 type lineItem struct {
-	m    *model
-	line *protocol.TranscriptLine
+	m      *model
+	line   *protocol.TranscriptLine
+	frozen bool // once true, CacheKey returns "" and the list never re-renders
 }
 
 func (it *lineItem) Render(w int) string { return it.m.renderLine(it.line, w) }
-func (it *lineItem) CacheKey() string    { return it.m.lineCacheKey(it.line) }
+func (it *lineItem) CacheKey() string {
+	if it.frozen {
+		return "" // frozen items are memoized forever by the list
+	}
+	return it.m.lineCacheKey(it.line)
+}
 
 // rebuildTranscript re-derives the list items from the (freshly replaced)
 // transcript state. Item identity is stable per line id so unchanged lines
 // keep their memoized render and the scroll position is preserved.
+// When a line's phase changes to "finished", it is frozen (never re-rendered).
 func (m *model) rebuildTranscript() {
 	items := make([]list.Item, 0, len(m.st.transcript))
 	present := make(map[string]bool, len(m.st.transcript))
@@ -229,6 +270,10 @@ func (m *model) rebuildTranscript() {
 			m.itemsByID[l.ID] = it
 		}
 		it.line = l
+		// Freeze finished items so they never re-render.
+		if l.Phase == "finished" {
+			it.frozen = true
+		}
 		items = append(items, it)
 	}
 	for id := range m.itemsByID {
@@ -308,6 +353,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, modPanelTick()
 		}
 		m.modPanelPoll = false
+		return m, nil
+
+	case hintTickMsg:
+		m.pruneStatusHint()
+		if m.st.statusHint != nil {
+			return m, hintTick()
+		}
 		return m, nil
 	}
 
@@ -398,6 +450,19 @@ func (m *model) reduce(f any, transcriptChanged *bool) tea.Cmd {
 
 	case *protocol.PendingApprovals:
 		m.st.pendingApprovals = fr.Items
+		// prune decided approvals that are no longer pending
+		for id := range m.decidedApprovals {
+			found := false
+			for _, a := range fr.Items {
+				if a.ID == id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delete(m.decidedApprovals, id)
+			}
+		}
 		return m.syncApprovalUI()
 
 	case *protocol.CommandCatalog:
@@ -450,6 +515,9 @@ func (m *model) applyDevice(d *protocol.DeviceState) {
 	case d.Model.Label != "":
 		m.modelHandle = d.Model.Label
 	}
+	if d.Usage != nil {
+		m.smoothTokens(d.Usage.TotalTokens)
+	}
 }
 
 // ── toasts ──
@@ -481,6 +549,65 @@ func toastTick() tea.Cmd {
 
 func modPanelTick() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return modPanelTickMsg{} })
+}
+
+func hintTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return hintTickMsg{} })
+}
+
+// ── statusline hints ──
+
+func (m *model) pushStatusHint(level, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	m.st.statusHint = &statusHint{level: level, text: text, expire: time.Now().Add(3 * time.Second)}
+}
+
+func (m *model) pruneStatusHint() {
+	if m.st.statusHint != nil && time.Now().After(m.st.statusHint.expire) {
+		m.st.statusHint = nil
+	}
+}
+
+// ── token smoothing ──
+
+func (m *model) smoothTokens(target int) {
+	gap := target - m.displayTokens
+	if gap == 0 {
+		return
+	}
+	step := 0
+	switch {
+	case gap > 0 && gap < 70:
+		step = min(gap, 3)
+	case gap > 0 && gap < 200:
+		step = max(1, int(float64(gap)*0.15))
+	case gap > 0:
+		step = min(gap, 50)
+	case gap < 0 && -gap < 70:
+		step = max(gap, -3)
+	case gap < 0 && -gap < 200:
+		step = min(-1, int(float64(gap)*0.15))
+	case gap < 0:
+		step = max(gap, -50)
+	}
+	m.displayTokens += step
+}
+
+// isBYOK returns (isBYOK, isOpenAICodex) for a model handle.
+func isBYOK(handle string) (bool, bool) {
+	h := strings.ToLower(handle)
+	if strings.Contains(h, "openai") {
+		return true, true
+	}
+	if strings.Contains(h, "anthropic") || strings.Contains(h, "claude") ||
+		strings.Contains(h, "gemini") || strings.Contains(h, "google") ||
+		strings.Contains(h, "deepseek") || strings.Contains(h, "mistral") ||
+		strings.Contains(h, "groq") || strings.Contains(h, "x.ai") || strings.Contains(h, "xai") {
+		return true, false
+	}
+	return false, false
 }
 
 // notifyTurnComplete pings the terminal (OSC 9 desktop notification + BEL) when
@@ -933,13 +1060,14 @@ func (m *model) cycleMode() (tea.Model, tea.Cmd) {
 	}
 	m.cli.Send(protocol.NewChangeMode(next))
 	m.mode = next // optimistic; the device frame re-echoes authoritatively
-	return m, nil
+	m.pushStatusHint("info", "permission mode → "+string(next))
+	return m, hintTick()
 }
 
 // ── approval / question modal ──
 
 // approvalOptionCount returns the number of numbered options for the head
-// approval: "Yes" + one per permission suggestion + "No".
+// approval: "Yes" + one per permission suggestion + "No" (with inline text input).
 func (m *model) approvalOptionCount() int {
 	if len(m.st.pendingApprovals) == 0 {
 		return 0
@@ -954,13 +1082,21 @@ func (m *model) sendApprovalChoice(sel int) {
 	switch {
 	case sel == 0: // Yes
 		m.cli.Send(protocol.NewApprovalResponse(a.ID, "allow"))
+		m.decidedApprovals[a.ID] = decidedApproval{decision: "allow", toolName: a.ToolName}
 	case sel == last: // No
-		m.cli.Send(protocol.NewApprovalResponse(a.ID, "deny"))
+		resp := protocol.NewApprovalResponse(a.ID, "deny")
+		if m.denyText != "" {
+			resp.Message = m.denyText
+		}
+		m.cli.Send(resp)
+		m.decidedApprovals[a.ID] = decidedApproval{decision: "deny", toolName: a.ToolName}
 	default: // Yes + permission suggestion
 		resp := protocol.NewApprovalResponse(a.ID, "allow")
 		resp.SelectedSuggestionIDs = []string{a.PermissionSuggestions[sel-1].ID}
 		m.cli.Send(resp)
+		m.decidedApprovals[a.ID] = decidedApproval{decision: "allow", toolName: a.ToolName}
 	}
+	m.denyText = "" // reset custom deny text
 }
 
 func (m *model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -969,7 +1105,62 @@ func (m *model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	a := m.st.pendingApprovals[0]
 	n := m.approvalOptionCount()
-	switch msg.String() {
+	last := n - 1
+	s := msg.String()
+
+	// When the "No" option is selected, typing enters custom denial text.
+	if m.approvalSel == last {
+		switch s {
+		case "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+		case "up", "ctrl+p":
+			if m.approvalSel > 0 {
+				m.approvalSel--
+				m.denyText = ""
+			}
+		case "down", "ctrl+n":
+			if m.approvalSel < n-1 {
+				m.approvalSel++
+				m.denyText = ""
+			}
+		case "enter":
+			m.sendApprovalChoice(m.approvalSel)
+		case "esc":
+			if m.denyText != "" {
+				m.denyText = ""
+			} else {
+				m.cli.Send(protocol.NewApprovalResponse(a.ID, "deny"))
+				m.decidedApprovals[a.ID] = decidedApproval{decision: "deny", toolName: a.ToolName}
+			}
+		case "backspace":
+			if len(m.denyText) > 0 {
+				m.denyText = m.denyText[:len(m.denyText)-1]
+			}
+		case "y":
+			m.sendApprovalChoice(0)
+		case "d", "n":
+			// Already on No; ignore
+		default:
+			// Number keys jump to another option directly (1-indexed).
+			if len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+				if idx := int(s[0] - '1'); idx < n {
+					m.approvalSel = idx
+					m.denyText = ""
+					if idx != last {
+						m.sendApprovalChoice(idx)
+					}
+				}
+			} else if len(s) == 1 && s[0] >= ' ' {
+				// Append printable character to custom deny text
+				m.denyText += s
+			}
+		}
+		return m, nil
+	}
+
+	// Not on the "No" option: standard navigation.
+	switch s {
 	case "ctrl+c":
 		m.quitting = true
 		return m, tea.Quit
@@ -985,14 +1176,16 @@ func (m *model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.sendApprovalChoice(m.approvalSel)
 	case "esc":
 		m.cli.Send(protocol.NewApprovalResponse(a.ID, "deny"))
+		m.decidedApprovals[a.ID] = decidedApproval{decision: "deny", toolName: a.ToolName}
 	case "y":
 		m.sendApprovalChoice(0)
 	case "d", "n":
 		m.cli.Send(protocol.NewApprovalResponse(a.ID, "deny"))
+		m.decidedApprovals[a.ID] = decidedApproval{decision: "deny", toolName: a.ToolName}
 	default:
 		// Number keys jump to and select an option directly (1-indexed).
-		if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
-			if idx := int(s[0]-'1'); idx < n {
+		if len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+			if idx := int(s[0] - '1'); idx < n {
 				m.sendApprovalChoice(idx)
 			}
 		}
@@ -1006,6 +1199,7 @@ func (m *model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // the pending_approvals array.
 func (m *model) syncApprovalUI() tea.Cmd {
 	m.approvalSel = 0 // reset the numbered-option cursor for the new head
+	m.denyText = ""   // reset custom deny text
 	if len(m.st.pendingApprovals) == 0 {
 		m.question = nil
 		return nil
@@ -1122,6 +1316,10 @@ func (m *model) markdownRenderer(width int) *glamour.TermRenderer {
 // ── transcript line rendering ──
 
 func (m *model) lineCacheKey(l *protocol.TranscriptLine) string {
+	// Finished items get a stable key that never changes (they will be frozen).
+	if l.Phase == "finished" {
+		return fmt.Sprintf("FIN|%s|%s", l.Kind, l.ID)
+	}
 	ok := ""
 	if l.ResultOk != nil {
 		ok = fmt.Sprintf("%v", *l.ResultOk)
@@ -1134,9 +1332,12 @@ func (m *model) lineCacheKey(l *protocol.TranscriptLine) string {
 	if l.Streaming != nil {
 		sc = l.Streaming.TotalLineCount
 	}
-	return fmt.Sprintf("%s|%d|%d|%d|%s|%s|%s|%d|%v|%v|%v",
+	// Include subagent count so subagent lines re-render when turn changes.
+	subagentHash := len(m.st.turn.ActiveSubagents)
+	return fmt.Sprintf("%s|%d|%d|%d|%s|%s|%s|%d|%v|%v|%v|%d|%d",
 		l.Kind, len(l.Text), len(l.ResultText), len(l.Output),
-		l.Phase, ok, success, sc, m.showReasoning, m.showToolOutput, m.isExecuting(l))
+		l.Phase, ok, success, sc, m.showReasoning, m.showToolOutput, m.isExecuting(l),
+		subagentHash, len(m.st.turn.ExecutingToolCallIDs))
 }
 
 // isExecuting reports whether a tool_call line is currently running client-side
@@ -1215,6 +1416,9 @@ func (m *model) renderLine(l *protocol.TranscriptLine, w int) string {
 		}
 		return wrap.Render(styleInfo.Render("◦ " + txt))
 
+	case "subagent":
+		return wrap.Render(m.renderSubagentLine(l, w))
+
 	case "status":
 		return wrap.Render(styleInfo.Render(strings.Join(l.Lines, "\n")))
 
@@ -1279,6 +1483,53 @@ func formatK(n int) string {
 	return strconv.Itoa(n)
 }
 
+// renderSubagentLine renders subagent activity from the transcript.
+// The server pushes active_subagents in the turn frame; we render them
+// as a tree with status indicators.
+func (m *model) renderSubagentLine(l *protocol.TranscriptLine, w int) string {
+	var b strings.Builder
+	// Header: count and status
+	n := len(m.st.turn.ActiveSubagents)
+	if n == 0 {
+		return ""
+	}
+	status := styleAccent.Render(fmt.Sprintf("⚙ Running %d agent%s", n, plural(n)))
+	b.WriteString(status)
+	// Per-agent details from the line's event data if available
+	if l.EventData != nil {
+		if agents, ok := l.EventData["agents"].([]any); ok {
+			for i, ag := range agents {
+				if am, ok := ag.(map[string]any); ok {
+					branch := "├─"
+					if i == len(agents)-1 {
+						branch = "└─"
+					}
+					desc := str(am["description"])
+					if desc == "" {
+						desc = str(am["name"])
+					}
+					typ := str(am["type"])
+					model := str(am["model"])
+					stats := ""
+					if steps, ok := am["steps"].(float64); ok && steps > 0 {
+						stats = fmt.Sprintf(" · %.0f steps", steps)
+					}
+					line := fmt.Sprintf("%s %s", branch, desc)
+					if typ != "" {
+						line += styleOverlayDim.Render(fmt.Sprintf(" · %s", typ))
+					}
+					if model != "" {
+						line += styleOverlayDim.Render(fmt.Sprintf(" · %s", model))
+					}
+					line += styleOverlayDim.Render(stats)
+					b.WriteString("\n" + compactOneLine(line, w-4))
+				}
+			}
+		}
+	}
+	return b.String()
+}
+
 // ── statusline & activity ──
 
 func turnVerb(t protocol.TurnState) string {
@@ -1319,6 +1570,17 @@ func turnVerb(t protocol.TurnState) string {
 }
 
 func (m *model) statusline() string {
+	// A transient hint (mode/queue change) preempts the left column for its TTL.
+	if h := m.st.statusHint; h != nil {
+		style := styleInfo
+		switch h.level {
+		case "error":
+			style = styleError
+		case "warning":
+			style = lipgloss.NewStyle().Foreground(theme.Warn)
+		}
+		return style.Render("• " + h.text)
+	}
 	status := turnVerb(m.st.turn)
 	// Native NetworkPhase indicator (upload/download/error).
 	switch m.st.turn.Network {
@@ -1359,7 +1621,16 @@ func (m *model) statusline() string {
 
 	left := pill + styleInfo.Render(fmt.Sprintf(" %s · %s ", agent, conv))
 	if md := shortModel(m.modelHandle); md != "" {
-		left += styleAccent.Render("◇ "+md) + " "
+		left += styleAccent.Render("◇ " + md)
+		// BYOK indicator: ▲ (green for OpenAI Codex, yellow otherwise).
+		if byok, codex := isBYOK(m.modelHandle); byok {
+			if codex {
+				left += " " + styleBYOKOpenAI.Render("▲")
+			} else {
+				left += " " + styleBYOKOther.Render("▲")
+			}
+		}
+		left += " "
 	}
 	left += status
 	if m.st.device != nil && m.st.device.Usage != nil {

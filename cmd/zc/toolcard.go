@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	toolBodyCollapsedLines = 4
+	toolBodyCollapsedLines = 3
 	toolBodyExpandedLines  = 30
 )
 
@@ -133,115 +133,292 @@ func toolStatus(l *protocol.TranscriptLine) string {
 	}
 }
 
+// phaseDot returns the appropriate phase indicator dot/string for a tool.
+func (m *model) phaseDot(l *protocol.TranscriptLine) string {
+	switch l.Phase {
+	case "streaming":
+		return styleToolPhaseStreaming.Render("●")
+	case "ready", "running":
+		// Blinking dot: use the spinner's current frame for a living feel.
+		if m.spinning {
+			return styleToolPhaseRunning.Render(m.spin.View())
+		}
+		return styleToolPhaseRunning.Render("●")
+	case "finished":
+		if l.ResultOk != nil && !*l.ResultOk {
+			return styleToolPhaseError.Render("●")
+		}
+		return styleToolPhaseSuccess.Render("●")
+	default:
+		return styleTool.Render(iconToolPending)
+	}
+}
+
 // renderToolCard renders a tool_call transcript Line: header + optional body.
 func (m *model) renderToolCard(l *protocol.TranscriptLine, w int) string {
 	name := humanizeToolName(l.Name)
 	params := compactOneLine(toolParams(l.Name, l.ArgsText, m.serverCWD), max(20, w-len(name)-8))
 
-	var icon, suffix string
+	var suffix string
 	nameStyle := styleToolName
+	dot := m.phaseDot(l)
+
 	switch toolStatus(l) {
 	case "success":
-		icon = styleToolOK.Render(iconToolOK)
+		// dot already green
 	case "error":
-		icon = styleToolErr.Render(iconToolErr)
 		suffix = "  " + styleToolErr.Render("error")
 	default: // running / streaming args
 		if m.isExecuting(l) {
-			icon = styleAccent.Render("▸")
 			suffix = "  " + styleAccent.Render("running")
-		} else {
-			icon = styleTool.Render(iconToolPending)
 		}
 	}
-	header := fmt.Sprintf("%s %s %s%s", icon, nameStyle.Render(name), styleToolParam.Render(params), suffix)
+	header := fmt.Sprintf("%s %s %s%s", dot, nameStyle.Render(name), styleToolParam.Render(params), suffix)
 
-	// Edit/Write/MultiEdit: render a colored diff from the args (native diffview).
-	if diff := m.renderEditDiff(l, w); diff != "" {
-		return header + "\n" + diff
+	// Per-tool-type specialized rendering.
+	body := m.renderToolBodyByType(l, w)
+	if body != "" {
+		return header + "\n" + body
 	}
-	body := m.renderToolBody(l, w)
-	if body == "" {
-		return header
-	}
-	return header + "\n" + body
+	return header
 }
 
-// renderEditDiff builds a colored +/- diff for Edit/Write/MultiEdit tool cards
-// from the tool arguments (old_string→new_string, or content for Write).
-func (m *model) renderEditDiff(l *protocol.TranscriptLine, w int) string {
-	if l.ArgsText == "" {
+// renderToolBodyByType dispatches to specialized renderers by tool name.
+func (m *model) renderToolBodyByType(l *protocol.TranscriptLine, w int) string {
+	if l.ArgsText == "" && l.ResultText == "" {
 		return ""
 	}
-	var args map[string]any
-	if err := json.Unmarshal([]byte(l.ArgsText), &args); err != nil {
-		return ""
-	}
-	type edit struct{ oldS, newS string }
-	var edits []edit
+
 	switch l.Name {
-	case "Edit":
-		edits = append(edits, edit{str(args["old_string"]), str(args["new_string"])})
-	case "MultiEdit":
-		if raw, ok := args["edits"].([]any); ok {
-			for _, e := range raw {
-				if em, ok := e.(map[string]any); ok {
-					edits = append(edits, edit{str(em["old_string"]), str(em["new_string"])})
-				}
-			}
-		}
-	case "Write":
-		edits = append(edits, edit{"", str(args["content"])})
+	case "Bash", "bash":
+		return m.renderBashTool(l, w)
+	case "Edit", "str_replace_editor", "str_replace_based_edit_tool":
+		return m.renderEditDiff(l, w)
+	case "Write", "write_file":
+		return m.renderWriteTool(l, w)
+	case "Read", "read_file":
+		return m.renderReadTool(l, w)
+	case "Grep", "grep":
+		return m.renderSearchTool(l, w, "lines")
+	case "Glob", "glob":
+		return m.renderSearchTool(l, w, "files")
 	default:
+		return m.renderGenericToolBody(l, w)
+	}
+}
+
+// renderBashTool renders a bash/shell tool with $ prefix and └ result prefix.
+func (m *model) renderBashTool(l *protocol.TranscriptLine, w int) string {
+	var args map[string]any
+	_ = json.Unmarshal([]byte(l.ArgsText), &args)
+	cmd := ""
+	if c, ok := args["command"].(string); ok {
+		cmd = c
+	}
+
+	bodyW := max(10, w-4)
+	var out []string
+
+	// Command preview with $ prefix.
+	if cmd != "" {
+		for _, ln := range strings.Split(cmd, "\n") {
+			out = append(out, styleAccent.Render("$ "+compactOneLine(ln, bodyW-2)))
+		}
+	}
+
+	// Result with └ prefix.
+	ret := strings.TrimRight(l.ResultText, "\n")
+	if ret != "" {
+		lines := strings.Split(ret, "\n")
+		maxLines := toolBodyCollapsedLines
+		if m.showToolOutput {
+			maxLines = toolBodyExpandedLines
+		}
+		shown := lines
+		if len(lines) > maxLines {
+			shown = lines[:maxLines]
+		}
+		for _, ln := range shown {
+			if lipgloss.Width(ln) > bodyW {
+				ln = compactOneLine(ln, bodyW)
+			}
+			out = append(out, styleToolBody.Render("└ "+ln))
+		}
+		if n := len(lines) - len(shown); n > 0 {
+			hint := "ctrl+o expands"
+			if m.showToolOutput {
+				hint = "output capped"
+			}
+			out = append(out, styleToolBody.Render(fmt.Sprintf("└ … +%d lines (%s)", n, hint)))
+		}
+	}
+
+	if len(out) == 0 {
 		return ""
 	}
+	return strings.Join(out, "\n")
+}
+
+// renderWriteTool renders a file write tool with summary and content preview.
+func (m *model) renderWriteTool(l *protocol.TranscriptLine, w int) string {
+	var args map[string]any
+	_ = json.Unmarshal([]byte(l.ArgsText), &args)
+	path := ""
+	if p, ok := args["file_path"].(string); ok && p != "" {
+		path = p
+	} else if p, ok := args["path"].(string); ok && p != "" {
+		path = p
+	}
+
+	content := ""
+	if c, ok := args["content"].(string); ok {
+		content = c
+	}
+
+	bodyW := max(10, w-4)
+	var out []string
+
+	// Summary line.
+	lines := strings.Split(content, "\n")
+	lineCount := len(lines)
+	if lineCount > 0 && lines[len(lines)-1] == "" {
+		lineCount--
+	}
+	if path != "" {
+		out = append(out, styleToolName.Render(fmt.Sprintf("Wrote %d lines to %s", lineCount, path)))
+	}
+
+	// Content preview (first few lines).
 	maxLines := toolBodyCollapsedLines
 	if m.showToolOutput {
 		maxLines = toolBodyExpandedLines
 	}
-	bodyW := max(10, w-4)
-	var out []string
-	for _, e := range edits {
-		if e.oldS != "" {
-			for _, ln := range strings.Split(strings.TrimRight(e.oldS, "\n"), "\n") {
-				out = append(out, styleDiffRemove.Render("  │ - "+compactOneLine(ln, bodyW)))
-			}
-		}
-		if e.newS != "" {
-			for _, ln := range strings.Split(strings.TrimRight(e.newS, "\n"), "\n") {
-				out = append(out, styleDiffAdd.Render("  │ + "+compactOneLine(ln, bodyW)))
-			}
-		}
+	shown := lines
+	if len(lines) > maxLines {
+		shown = lines[:maxLines]
 	}
+	for _, ln := range shown {
+		if lipgloss.Width(ln) > bodyW {
+			ln = compactOneLine(ln, bodyW)
+		}
+		out = append(out, styleDiffAdd.Render("+ "+ln))
+	}
+	if n := len(lines) - len(shown); n > 0 {
+		hint := "ctrl+o expands"
+		if m.showToolOutput {
+			hint = "output capped"
+		}
+		out = append(out, styleToolBody.Render(fmt.Sprintf("… +%d lines (%s)", n, hint)))
+	}
+
 	if len(out) == 0 {
 		return ""
 	}
-	shown := out
-	if len(out) > maxLines {
-		shown = out[:maxLines]
+	return strings.Join(out, "\n")
+}
+
+// renderReadTool renders a file read tool with line count.
+func (m *model) renderReadTool(l *protocol.TranscriptLine, w int) string {
+	var args map[string]any
+	_ = json.Unmarshal([]byte(l.ArgsText), &args)
+	path := ""
+	if p, ok := args["file_path"].(string); ok && p != "" {
+		path = p
+	} else if p, ok := args["path"].(string); ok && p != "" {
+		path = p
 	}
-	res := strings.Join(shown, "\n")
-	if n := len(out) - len(shown); n > 0 {
+
+	ret := strings.TrimRight(l.ResultText, "\n")
+	if ret == "" && path == "" {
+		return ""
+	}
+
+	bodyW := max(10, w-4)
+	var out []string
+
+	// Show line count if we have content.
+	if ret != "" {
+		lines := strings.Split(ret, "\n")
+		lineCount := len(lines)
+		if lineCount > 0 && lines[len(lines)-1] == "" {
+			lineCount--
+		}
+		if path != "" {
+			out = append(out, styleToolParam.Render(fmt.Sprintf("Read %d lines from %s", lineCount, path)))
+		}
+
+		maxLines := toolBodyCollapsedLines
+		if m.showToolOutput {
+			maxLines = toolBodyExpandedLines
+		}
+		shown := lines
+		if len(lines) > maxLines {
+			shown = lines[:maxLines]
+		}
+		for _, ln := range shown {
+			if lipgloss.Width(ln) > bodyW {
+				ln = compactOneLine(ln, bodyW)
+			}
+			out = append(out, styleToolBody.Render("└ "+ln))
+		}
+		if n := len(lines) - len(shown); n > 0 {
+			hint := "ctrl+o expands"
+			if m.showToolOutput {
+				hint = "output capped"
+			}
+			out = append(out, styleToolBody.Render(fmt.Sprintf("└ … +%d lines (%s)", n, hint)))
+		}
+	} else if path != "" {
+		out = append(out, styleToolParam.Render("Reading "+path))
+	}
+
+	return strings.Join(out, "\n")
+}
+
+// renderSearchTool renders grep/glob tools with a "Found N" summary.
+func (m *model) renderSearchTool(l *protocol.TranscriptLine, w int, unit string) string {
+	ret := strings.TrimRight(l.ResultText, "\n")
+	if ret == "" {
+		return ""
+	}
+
+	lines := strings.Split(ret, "\n")
+	count := len(lines)
+	if count > 0 && lines[len(lines)-1] == "" {
+		count--
+	}
+
+	bodyW := max(10, w-4)
+	var out []string
+	out = append(out, styleToolName.Render(fmt.Sprintf("Found %d %s", count, unit)))
+
+	maxLines := toolBodyCollapsedLines
+	if m.showToolOutput {
+		maxLines = toolBodyExpandedLines
+	}
+	shown := lines
+	if len(lines) > maxLines {
+		shown = lines[:maxLines]
+	}
+	for _, ln := range shown {
+		if lipgloss.Width(ln) > bodyW {
+			ln = compactOneLine(ln, bodyW)
+		}
+		out = append(out, styleToolBody.Render("└ "+ln))
+	}
+	if n := len(lines) - len(shown); n > 0 {
 		hint := "ctrl+o expands"
 		if m.showToolOutput {
-			hint = "diff capped"
+			hint = "output capped"
 		}
-		res += "\n" + styleToolBody.Render(fmt.Sprintf("  │ … +%d lines (%s)", n, hint))
+		out = append(out, styleToolBody.Render(fmt.Sprintf("└ … +%d lines (%s)", n, hint)))
 	}
-	return res
+
+	return strings.Join(out, "\n")
 }
 
-// str coerces a JSON value to a string (empty for non-strings/nil).
-func str(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
-}
-
-// renderToolBody renders the truncated result: dim lines behind a rail,
-// expanded by ctrl+o (m.showToolOutput).
-func (m *model) renderToolBody(l *protocol.TranscriptLine, w int) string {
+// renderGenericToolBody renders the truncated result with └ L-bracket prefix.
+func (m *model) renderGenericToolBody(l *protocol.TranscriptLine, w int) string {
 	ret := strings.TrimRight(l.ResultText, "\n")
 	if ret == "" {
 		return ""
@@ -261,14 +438,91 @@ func (m *model) renderToolBody(l *protocol.TranscriptLine, w int) string {
 		if lipgloss.Width(ln) > bodyW {
 			ln = compactOneLine(ln, bodyW)
 		}
-		b.WriteString(styleToolBody.Render("  │ "+ln) + "\n")
+		b.WriteString(styleToolBody.Render("└ "+ln) + "\n")
 	}
 	if n := len(lines) - len(shown); n > 0 {
 		hint := "ctrl+o expands"
 		if m.showToolOutput {
 			hint = "output capped"
 		}
-		b.WriteString(styleToolBody.Render(fmt.Sprintf("  │ … +%d lines (%s)", n, hint)) + "\n")
+		b.WriteString(styleToolBody.Render(fmt.Sprintf("└ … +%d lines (%s)", n, hint)) + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderEditDiff builds a colored +/- diff for Edit/Write/MultiEdit tool cards
+// from the tool arguments (old_string→new_string, or content for Write).
+func (m *model) renderEditDiff(l *protocol.TranscriptLine, w int) string {
+	if l.ArgsText == "" {
+		return ""
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(l.ArgsText), &args); err != nil {
+		return ""
+	}
+	type edit struct{ oldS, newS string }
+	var edits []edit
+	switch l.Name {
+	case "Edit", "str_replace_editor", "str_replace_based_edit_tool":
+		edits = append(edits, edit{str(args["old_string"]), str(args["new_string"])})
+	case "MultiEdit":
+		if raw, ok := args["edits"].([]any); ok {
+			for _, e := range raw {
+				if em, ok := e.(map[string]any); ok {
+					edits = append(edits, edit{str(em["old_string"]), str(em["new_string"])})
+				}
+			}
+		}
+	default:
+		return ""
+	}
+	maxLines := toolBodyCollapsedLines
+	if m.showToolOutput {
+		maxLines = toolBodyExpandedLines
+	}
+	bodyW := max(10, w-4)
+	var out []string
+	for _, e := range edits {
+		if e.oldS != "" {
+			for _, ln := range strings.Split(strings.TrimRight(e.oldS, "\n"), "\n") {
+				out = append(out, styleDiffRemove.Render("- "+compactOneLine(ln, bodyW)))
+			}
+		}
+		if e.newS != "" {
+			for _, ln := range strings.Split(strings.TrimRight(e.newS, "\n"), "\n") {
+				out = append(out, styleDiffAdd.Render("+ "+compactOneLine(ln, bodyW)))
+			}
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	shown := out
+	if len(out) > maxLines {
+		shown = out[:maxLines]
+	}
+	res := strings.Join(shown, "\n")
+	if n := len(out) - len(shown); n > 0 {
+		hint := "ctrl+o expands"
+		if m.showToolOutput {
+			hint = "diff capped"
+		}
+		res += "\n" + styleToolBody.Render(fmt.Sprintf("… +%d lines (%s)", n, hint))
+	}
+	return res
+}
+
+// str coerces a JSON value to a string (empty for non-strings/nil).
+func str(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// renderToolBody renders the truncated result: dim lines behind a rail,
+// expanded by ctrl+o (m.showToolOutput).
+// Deprecated: use renderGenericToolBody or the per-type renderers.
+func (m *model) renderToolBody(l *protocol.TranscriptLine, w int) string {
+	return m.renderGenericToolBody(l, w)
 }
