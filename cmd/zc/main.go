@@ -775,6 +775,14 @@ func (m *model) handlePaletteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if chosen == "" {
 			it, ok := p.current()
 			if !ok {
+				// No-match fallback: submit the raw typed text so unknown/custom
+				// commands aren't blocked by the palette (native behavior).
+				m.palette = nil
+				if strings.TrimSpace(p.filter) != "" {
+					return m.handleSubmit()
+				}
+				m.input.SetValue("")
+				m.autosize()
 				return m, nil
 			}
 			chosen = it.id
@@ -799,6 +807,14 @@ func (m *model) handlePaletteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.input.CursorEnd()
 		p.sel = 0
 		p.clampSel()
+	case " ":
+		// A space closes the palette so the user can type command arguments
+		// (native SlashCommandAutocomplete closes on the first space).
+		m.palette = nil
+		m.input.SetValue("/" + p.filter + " ")
+		m.input.CursorEnd()
+		m.autosize()
+		return m, nil
 	default:
 		if s := msg.String(); len(s) == 1 && s >= " " {
 			p.filter += s
