@@ -1810,7 +1810,20 @@ func (m *model) viewContent() string {
 		case m.selection != nil:
 			body = m.selection.render(max(m.width-4, 32), 18)
 		default:
-			body = styleInfo.Render("entering lobby…")
+			logo := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render("ZeptoCode")
+			lines := []string{
+				logo,
+				"",
+				styleInfo.Render("a thin-client TUI for Letta Code"),
+			}
+			if ver := m.st.lettaVersion; ver != "" {
+				lines = append(lines, styleAccent.Render("Letta Code "+ver))
+			}
+			if b := m.st.runtimeBuild; b != "" {
+				lines = append(lines, styleInfo.Render("runtime "+b))
+			}
+			lines = append(lines, "", styleAccent.Render("select an agent to begin"))
+			body = lipgloss.JoinVertical(lipgloss.Center, lines...)
 		}
 		if m.width > 0 && m.height > 0 {
 			return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
