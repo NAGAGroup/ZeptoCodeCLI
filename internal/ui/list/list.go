@@ -72,6 +72,25 @@ func (l *List) Append(it Item) {
 	l.items = append(l.items, it)
 }
 
+// Sync replaces the item set while PRESERVING the render cache and scroll
+// state. This is the reducer path for the `transcript` frame, which pushes
+// the whole Line[] every time: callers reuse stable Item identities (keyed by
+// line id) so unchanged items keep their memoized render, and scroll/follow is
+// not disturbed mid-stream. Cache entries for removed items are pruned.
+func (l *List) Sync(items []Item) {
+	present := make(map[Item]bool, len(items))
+	for _, it := range items {
+		present[it] = true
+	}
+	for it := range l.cache {
+		if !present[it] {
+			delete(l.cache, it)
+		}
+	}
+	l.items = items
+	l.clamp()
+}
+
 // Len returns the number of items.
 func (l *List) Len() int { return len(l.items) }
 

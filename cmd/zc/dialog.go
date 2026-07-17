@@ -7,6 +7,10 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
 	"charm.land/lipgloss/v2"
 )
 
@@ -39,17 +43,49 @@ func (m *model) activeDialog() string {
 	case m.question != nil:
 		return dialogBox("agent asks", "esc dismisses = deny",
 			m.question.form.View(w-4), w)
-	case m.pager != nil:
-		return m.pager.render(m.width, m.height)
-	case m.overlay != nil:
-		return m.overlay.render(w, 18)
-	case len(m.approvals) > 0:
+	case len(m.st.pendingApprovals) > 0:
 		return m.renderModal()
 	case m.showHelp:
 		return dialogBox("keybindings", "esc or ctrl+g closes",
 			m.helpModel.FullHelpView(keys.FullHelp()), w)
 	}
 	return ""
+}
+
+// renderModal renders the head pending_approvals item as an allow/deny
+// dialog. Additional queued approvals are counted in the header.
+func (m *model) renderModal() string {
+	a := m.st.pendingApprovals[0]
+
+	// Prefer a JSON-pretty of the tool input; fall back to raw diffs blob.
+	var detail string
+	if len(a.Input) > 0 {
+		input, _ := json.MarshalIndent(a.Input, "", "  ")
+		detail = string(input)
+	} else if len(a.Diffs) > 0 {
+		detail = string(a.Diffs)
+	}
+	if lines := strings.Split(detail, "\n"); len(lines) > 12 {
+		detail = strings.Join(lines[:12], "\n") + "\n…"
+	}
+
+	queued := ""
+	if n := len(m.st.pendingApprovals) - 1; n > 0 {
+		queued = fmt.Sprintf("  (+%d queued)", n)
+	}
+
+	options := "[a]llow   [d]eny"
+	for i, s := range a.PermissionSuggestions {
+		options += fmt.Sprintf("   [%d] %s", i+1, s.Label)
+	}
+	if a.BlockedPath != "" {
+		options = styleError.Render("blocked: "+a.BlockedPath) + "\n" + options
+	}
+
+	w := dialogWidth(m.width)
+	body := fmt.Sprintf("agent wants to run %s%s\n\n%s\n\n%s",
+		styleToolName.Render(a.ToolName), queued, detail, styleInfo.Render(options))
+	return dialogBox("tool approval", "a/d or a number", body, w)
 }
 
 // compositeDialog centers box over base. Layer x/y/z are resolved by the

@@ -1,30 +1,25 @@
-// Package protocol implements the interactive-conversation subset of the
-// Letta Code app-server WebSocket protocol (protocol_v2).
+// Package protocol mirrors the zc UI wire contract 1:1 from the letta-code
+// fork's src/zc/protocol.ts (SPEC draft 5, PROTOCOL_VERSION 2). The server
+// pushes JSON state frames; the client is a reducer (state, frame) -> state.
+// Client -> server is a small set of fire-and-forget events.
 //
-// Source of truth: @letta-ai/letta-code/app-server-protocol (shipped .d.ts,
-// a 1:1 re-export of src/types/protocol_v2.ts). There is no wire-level
-// version negotiation; this package is written against letta-code 0.28.x.
-// On upstream bumps, diff the shipped .d.ts between npm versions for an
-// exact changelog.
-//
-// Decoding is deliberately tolerant: unknown frame types and unknown fields
-// are preserved or skipped, never fatal.
+// Every JSON field name here matches protocol.ts (and, for TranscriptLine,
+// the native accumulator `Line` union in src/cli/helpers/accumulator.ts,
+// which is camelCase because it is serialized verbatim). Go has no unions,
+// so TranscriptLine is one struct keyed by Kind with every field omitempty.
 package protocol
 
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 )
 
-// ── Shared scopes & enums ──
+// PROTOCOL_VERSION is the wire version this client speaks. It matches
+// protocol.ts `PROTOCOL_VERSION`.
+const ProtocolVersion = 2
 
-type RuntimeScope struct {
-	AgentID        string `json:"agent_id"`
-	ConversationID string `json:"conversation_id"`
-	ActingUserID   string `json:"acting_user_id,omitempty"`
-}
-
+// PermissionMode is the enforced-below-the-seam permission mode carried by
+// the device frame and set by change_mode.
 type PermissionMode string
 
 const (
@@ -33,759 +28,512 @@ const (
 	ModeUnrestricted PermissionMode = "unrestricted"
 )
 
-// LoopStatus values (LoopStatus union in protocol_v2).
-const (
-	LoopSendingAPIRequest   = "SENDING_API_REQUEST"
-	LoopWaitingForResponse  = "WAITING_FOR_API_RESPONSE"
-	LoopRetryingAPIRequest  = "RETRYING_API_REQUEST"
-	LoopProcessingResponse  = "PROCESSING_API_RESPONSE"
-	LoopExecutingClientTool = "EXECUTING_CLIENT_SIDE_TOOL"
-	LoopExecutingCommand    = "EXECUTING_COMMAND"
-	LoopWaitingOnApproval   = "WAITING_ON_APPROVAL"
-	LoopWaitingOnInput      = "WAITING_ON_INPUT"
-)
+// ─────────────────────────────────────────────────────────────────────
+// Server → client frames
+// ─────────────────────────────────────────────────────────────────────
 
-type LoopState struct {
-	Status               string   `json:"status"`
-	ActiveRunIDs         []string `json:"active_run_ids"`
-	ExecutingToolCallIDs []string `json:"executing_tool_call_ids"`
-}
-
-// ── Outbound commands (client → app-server, control channel) ──
-
-type ClientInfo struct {
-	Name    string `json:"name"`
-	Title   string `json:"title,omitempty"`
-	Version string `json:"version,omitempty"`
-}
-
-type CreateConversationOptions struct {
-	Body map[string]any `json:"body"`
-}
-
-type RuntimeStartCommand struct {
-	Type               string                     `json:"type"` // "runtime_start"
-	RequestID          string                     `json:"request_id"`
-	AgentID            string                     `json:"agent_id,omitempty"`
-	ConversationID     string                     `json:"conversation_id,omitempty"`
-	CreateConversation *CreateConversationOptions `json:"create_conversation,omitempty"`
-	Mode               PermissionMode             `json:"mode,omitempty"`
-	ClientInfo         *ClientInfo                `json:"client_info,omitempty"`
-}
-
-type MessageCreate struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type InputCreateMessage struct {
-	Type    string       `json:"type"` // "input"
-	Runtime RuntimeScope `json:"runtime"`
-	Payload struct {
-		Kind     string          `json:"kind"` // "create_message"
-		Messages []MessageCreate `json:"messages"`
-	} `json:"payload"`
-}
-
-func NewUserMessage(rt RuntimeScope, text string) InputCreateMessage {
-	cmd := InputCreateMessage{Type: "input", Runtime: rt}
-	cmd.Payload.Kind = "create_message"
-	cmd.Payload.Messages = []MessageCreate{{Role: "user", Content: text}}
-	return cmd
-}
-
-// ApprovalDecision is either allow (optional updated input / persisted
-// permission suggestions) or deny (message required by the protocol).
-type ApprovalDecision struct {
-	Behavior                        string         `json:"behavior"` // "allow" | "deny"
-	Message                         string         `json:"message,omitempty"`
-	UpdatedInput                    map[string]any `json:"updated_input,omitempty"`
-	SelectedPermissionSuggestionIDs []string       `json:"selected_permission_suggestion_ids,omitempty"`
-}
-
-type InputApprovalResponse struct {
-	Type    string       `json:"type"` // "input"
-	Runtime RuntimeScope `json:"runtime"`
-	Payload struct {
-		Kind      string           `json:"kind"` // "approval_response"
-		RequestID string           `json:"request_id"`
-		Decision  ApprovalDecision `json:"decision"`
-	} `json:"payload"`
-}
-
-func NewApprovalResponse(rt RuntimeScope, requestID string, decision ApprovalDecision) InputApprovalResponse {
-	cmd := InputApprovalResponse{Type: "input", Runtime: rt}
-	cmd.Payload.Kind = "approval_response"
-	cmd.Payload.RequestID = requestID
-	cmd.Payload.Decision = decision
-	return cmd
-}
-
-type AbortMessageCommand struct {
-	Type      string       `json:"type"` // "abort_message"
-	Runtime   RuntimeScope `json:"runtime"`
-	RequestID string       `json:"request_id,omitempty"`
-}
-
-type AgentListCommand struct {
-	Type      string `json:"type"` // "agent_list"
-	RequestID string `json:"request_id"`
-}
-
-type ConversationMessagesListCommand struct {
-	Type           string         `json:"type"` // "conversation_messages_list"
-	RequestID      string         `json:"request_id"`
-	ConversationID string         `json:"conversation_id"`
-	Query          map[string]any `json:"query,omitempty"`
-}
-
-type ConversationListCommand struct {
-	Type      string         `json:"type"` // "conversation_list"
-	RequestID string         `json:"request_id"`
-	Query     map[string]any `json:"query,omitempty"`
-}
-
-// ExecuteCommandCommand dispatches a slash command (built-in or mod-provided);
-// results arrive as command_start/command_end stream deltas correlated by
-// request_id.
-type ExecuteCommandCommand struct {
-	Type      string       `json:"type"` // "execute_command"
-	CommandID string       `json:"command_id"`
-	RequestID string       `json:"request_id"`
-	Runtime   RuntimeScope `json:"runtime"`
-	Args      string       `json:"args,omitempty"`
-}
-
-type ChangeDeviceStatePayload struct {
-	Mode PermissionMode `json:"mode,omitempty"`
-	CWD  string         `json:"cwd,omitempty"`
-}
-
-type ChangeDeviceStateCommand struct {
-	Type    string                   `json:"type"` // "change_device_state"
-	Runtime RuntimeScope             `json:"runtime"`
-	Payload ChangeDeviceStatePayload `json:"payload"`
-}
-
-type ConversationForkCommand struct {
-	Type           string         `json:"type"` // "conversation_fork"
-	RequestID      string         `json:"request_id"`
-	ConversationID string         `json:"conversation_id"`
-	Body           map[string]any `json:"body,omitempty"`
-}
-
-type ConversationUpdateCommand struct {
-	Type           string         `json:"type"` // "conversation_update"
-	RequestID      string         `json:"request_id"`
-	ConversationID string         `json:"conversation_id"`
-	Body           map[string]any `json:"body"`
-}
-
-type ConversationRecompileCommand struct {
-	Type           string `json:"type"` // "conversation_recompile"
-	RequestID      string `json:"request_id"`
-	ConversationID string `json:"conversation_id"`
-}
-
-// GetExperimentsCommand / SetExperimentCommand toggle local experiments.
-type GetExperimentsCommand struct {
-	Type      string `json:"type"` // "get_experiments"
-	RequestID string `json:"request_id"`
-}
-
-type SetExperimentCommand struct {
-	Type         string `json:"type"` // "set_experiment"
-	RequestID    string `json:"request_id"`
-	ExperimentID string `json:"experiment_id"`
-	Enabled      *bool  `json:"enabled"` // null clears the override
-}
-
-type ExperimentSnapshot struct {
-	ID          string `json:"id"`
-	Label       string `json:"label"`
-	Description string `json:"description"`
-	EnvVar      string `json:"envVar"`
-	Enabled     bool   `json:"enabled"`
-	Source      string `json:"source"`
-}
-
-// Reflection (sleeptime) settings: trigger off|step-count|compaction-event.
-// Both commands are runtime-scoped (validated server-side — an agent_id
-// field alone fails validation and the request is silently dropped).
-type GetReflectionSettingsCommand struct {
-	Type      string       `json:"type"` // "get_reflection_settings"
-	RequestID string       `json:"request_id"`
-	Runtime   RuntimeScope `json:"runtime"`
-}
-
-type ReflectionSettingsBody struct {
-	Trigger   string `json:"trigger"`
-	StepCount int    `json:"step_count"`
-}
-
-type SetReflectionSettingsCommand struct {
-	Type      string                 `json:"type"` // "set_reflection_settings"
-	RequestID string                 `json:"request_id"`
-	Runtime   RuntimeScope           `json:"runtime"`
-	Settings  ReflectionSettingsBody `json:"settings"`
-	Scope     string                 `json:"scope,omitempty"` // local_project|global|both
-}
-
-type ReflectionSettingsSnapshot struct {
-	AgentID   string `json:"agent_id"`
-	Trigger   string `json:"trigger"`
-	StepCount int    `json:"step_count"`
-}
-
-// BackgroundProcessSummary is a union: kind "bash" (command/exit_code) or
-// "agent_task" (task_type/description). Delivered inside device_status.
-type BackgroundProcessSummary struct {
-	ProcessID   string `json:"process_id"`
-	Kind        string `json:"kind"`
-	Command     string `json:"command"`
-	TaskType    string `json:"task_type"`
-	Description string `json:"description"`
-	StartedAtMs int64  `json:"started_at_ms"`
-	Status      string `json:"status"`
-	ExitCode    *int   `json:"exit_code"`
-}
-
-type AgentUpdateCommand struct {
-	Type      string         `json:"type"` // "agent_update"
-	RequestID string         `json:"request_id"`
-	AgentID   string         `json:"agent_id"`
-	Body      map[string]any `json:"body"`
-}
-
-type ListModelsCommand struct {
-	Type      string `json:"type"` // "list_models"
-	RequestID string `json:"request_id"`
-	Force     bool   `json:"force,omitempty"`
-}
-
-type UpdateModelPayload struct {
-	ModelID     string `json:"model_id,omitempty"`
-	ModelHandle string `json:"model_handle,omitempty"`
-}
-
-type UpdateModelCommand struct {
-	Type      string             `json:"type"` // "update_model"
-	RequestID string             `json:"request_id"`
-	Runtime   RuntimeScope       `json:"runtime"`
-	Payload   UpdateModelPayload `json:"payload"`
-}
-
-type ModelEntry struct {
-	ID          string `json:"id"`
-	Handle      string `json:"handle"`
-	Label       string `json:"label"`
-	Description string `json:"description"`
-	IsDefault   bool   `json:"isDefault"`
-	IsFeatured  bool   `json:"isFeatured"`
-	Free        bool   `json:"free"`
-}
-
-type ListModelsResponse struct {
-	Success          bool         `json:"success"`
-	Error            string       `json:"error"`
-	Entries          []ModelEntry `json:"entries"`
-	AvailableHandles []string     `json:"available_handles"`
-}
-
-type UpdateModelResponse struct {
-	Success     bool   `json:"success"`
-	Error       string `json:"error"`
-	AppliedTo   string `json:"applied_to"`
-	ModelID     string `json:"model_id"`
-	ModelHandle string `json:"model_handle"`
-}
-
-// Ack is the generic success/error envelope shared by CRUD responses.
-type Ack struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error"`
-	// conversation_fork_response carries the new conversation reference.
-	Conversation *ConversationSummary `json:"conversation"`
-}
-
-// ── Inbound frames (ui-server → client) ──
-
-// Frame is a decoded inbound frame. Exactly one typed field is non-nil;
-// Raw always holds the original JSON.
-type Frame struct {
-	Type      string
-	RequestID string
-	Raw       json.RawMessage
-
-	// ui-server push frames (not correlated to a client request)
-	HelloResponse    *HelloResponse
-	DeviceStatusFlat *DeviceStatusMessage
-	TurnStart        *TurnMessage
-	TurnEnd          *TurnMessage
-	TranscriptUpdate *TranscriptUpdateMessage
-	TranscriptSync   *TranscriptSyncMessage
-	CommandResult    *CommandResultMessage
-	BashOutput       *BashOutputMessage
-	ErrorMsg         *ErrorMessage
-	OverlayState     *OverlayStateMessage
-
-	// Shared (control_request is the same shape in both protocols)
-	ControlRequest *ControlRequest
-
-	// Legacy protocol_v2 fields (unused under ui-server, kept for reference)
-	RuntimeStartResponse *RuntimeStartResponse
-	StreamDelta          *StreamDeltaMessage
-	LoopStatus           *LoopStatusUpdate
-	DeviceStatus         *DeviceStatusUpdate
-	AgentList            *AgentListResponse
-	MessagesList         *ConversationMessagesListResponse
-	ConversationList     *ConversationListResponse
-	QueueUpdate          *QueueUpdate
-	SubagentUpdate       *SubagentUpdate
-	ListModels           *ListModelsResponse
-	UpdateModel          *UpdateModelResponse
-}
-
-// HelloResponse is the response to the hello handshake.
+// HelloResponse answers `hello`. A non-empty Error is a fatal startup
+// failure; the process exits after.
 type HelloResponse struct {
-	Type              string `json:"type"`
-	RequestID         string `json:"request_id"`
-	ProtocolVersion   int    `json:"protocol_version"`
-	RuntimeBuild      string `json:"runtime_build"`
-	LettaCodeVersion  string `json:"letta_code_version"`
-	AgentID           string `json:"agent_id"`
-	AgentName         string `json:"agent_name"`
-	ConversationID    string `json:"conversation_id"`
-	Model             string `json:"model"`
+	Type            string `json:"type"`
+	ProtocolVersion int    `json:"protocol_version"`
+	RuntimeBuild    string `json:"runtime_build"`
+	LettaCodeVer    string `json:"letta_code_version"`
+	Error           string `json:"error,omitempty"`
 }
 
-// DeviceStatusMessage is the flat device_status frame from the ui-server
-// (different from the nested update_device_status in protocol_v2).
-type DeviceStatusMessage struct {
-	Type              string           `json:"type"`
-	CWD               string           `json:"cwd"`
-	PermissionMode    PermissionMode   `json:"permission_mode"`
-	Model             string           `json:"model"`
-	AgentID           string           `json:"agent_id"`
-	AgentName         string           `json:"agent_name"`
-	ConversationID    string           `json:"conversation_id"`
-	Tools             []string         `json:"tools"`
-	LettaCodeVersion  string           `json:"letta_code_version"`
+// SessionPhase drives the lobby → chat machine.
+type SessionPhase struct {
+	Type           string `json:"type"`
+	Phase          string `json:"phase"` // "lobby" | "starting" | "chat"
+	AgentID        string `json:"agent_id,omitempty"`
+	AgentName      string `json:"agent_name,omitempty"` // string | null → "" when null
+	ConversationID string `json:"conversation_id,omitempty"`
 }
 
-// TurnMessage covers both turn_start (no stop_reason) and turn_end.
-type TurnMessage struct {
+// DeviceModel is the current model triple (all fields nullable in TS).
+type DeviceModel struct {
+	ID     string `json:"id,omitempty"`
+	Handle string `json:"handle,omitempty"`
+	Label  string `json:"label,omitempty"`
+}
+
+// DeviceAgent is the ambient agent identity for the statusline/header.
+type DeviceAgent struct {
+	ID              string `json:"id"`
+	Name            string `json:"name,omitempty"` // string | null
+	MemfsEnabled    bool   `json:"memfs_enabled"`
+	MemoryDirectory string `json:"memory_directory,omitempty"`
+}
+
+// DeviceConversation is the ambient conversation identity.
+type DeviceConversation struct {
+	ID    string `json:"id"`
+	Title string `json:"title,omitempty"`
+}
+
+// DeviceState is ambient status the statusline/header renders from.
+type DeviceState struct {
+	Type           string             `json:"type"`
+	CWD            string             `json:"cwd"`
+	PermissionMode PermissionMode     `json:"permission_mode"`
+	Model          DeviceModel        `json:"model"`
+	Agent          DeviceAgent        `json:"agent"`
+	Conversation   DeviceConversation `json:"conversation"`
+	Toolset        []string           `json:"toolset"`
+	LettaCodeVer   string             `json:"letta_code_version"`
+	ShouldDoctor   bool               `json:"should_doctor,omitempty"`
+}
+
+// Transcript carries the whole transcript as the native Line[] every push.
+// The client REPLACES its transcript state with Lines wholesale (never
+// merge/append).
+type Transcript struct {
+	Type           string           `json:"type"`
+	ConversationID string           `json:"conversation_id"`
+	Lines          []TranscriptLine `json:"lines"`
+}
+
+// TurnState drives spinner, input gating, ctrl+c arming, title blink.
+type TurnState struct {
 	Type       string `json:"type"`
+	Status     string `json:"status"` // idle|sending|thinking|streaming|executing_tool|waiting_on_approval|cancelling
 	StopReason string `json:"stop_reason,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
-// TranscriptUpdateMessage carries a streaming delta chunk.
-type TranscriptUpdateMessage struct {
-	Type   string `json:"type"`
-	Chunk  Delta  `json:"chunk"`
+// Active reports whether the turn is non-idle (spinner / interrupt armed).
+func (t TurnState) Active() bool {
+	return t.Status != "" && t.Status != "idle"
 }
 
-// TranscriptEntry is one entry in a transcript_sync.
-type TranscriptEntry struct {
-	ID   string `json:"id"`
-	Kind string `json:"kind"` // user, assistant, tool_call, tool_return, thinking, shell, event, error
-	Text string `json:"text"`
-	OTID string `json:"otid,omitempty"`
+// ApprovalQuestion is an AskUserQuestion payload carried by an approval.
+type ApprovalQuestion struct {
+	ID      string   `json:"id"`
+	Prompt  string   `json:"prompt"`
+	Options []string `json:"options,omitempty"`
+	Multi   bool     `json:"multi,omitempty"`
 }
 
-// TranscriptSyncMessage carries the accumulated entry model.
-type TranscriptSyncMessage struct {
-	Type    string            `json:"type"`
-	Entries []TranscriptEntry `json:"entries"`
+// PermissionSuggestion is a one-tap permission grant option.
+type PermissionSuggestion struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
 }
 
-// CommandResultMessage is the result of a slash command execution.
-type CommandResultMessage struct {
-	Type      string `json:"type"`
-	RequestID string `json:"request_id,omitempty"`
-	Success   bool   `json:"success"`
-	Output    string `json:"output"`
+// PendingApproval is a single outstanding approval request.
+type PendingApproval struct {
+	ID                    string                 `json:"id"` // tool_call_id
+	ToolName              string                 `json:"tool_name"`
+	Input                 map[string]any         `json:"input"`
+	Diffs                 json.RawMessage        `json:"diffs,omitempty"`
+	PermissionSuggestions []PermissionSuggestion `json:"permission_suggestions,omitempty"`
+	BlockedPath           string                 `json:"blocked_path,omitempty"`
+	Questions             []ApprovalQuestion     `json:"questions,omitempty"`
 }
 
-// BashOutputMessage is the output of a bash-mode (!) command.
-type BashOutputMessage struct {
-	Type   string `json:"type"`
-	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+// PendingApprovals is the approval-dialog state; non-empty renders the modal.
+type PendingApprovals struct {
+	Type  string            `json:"type"`
+	Items []PendingApproval `json:"items"`
 }
 
-// ErrorMessage is a generic error frame.
-type ErrorMessage struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-}
-
-// OverlayItem is a selectable item in an overlay descriptor.
-type OverlayItem struct {
+// SelectionOption is one choice in a server-initiated selection.
+type SelectionOption struct {
 	ID          string `json:"id"`
 	Label       string `json:"label"`
 	Description string `json:"description,omitempty"`
-	Badge       string `json:"badge,omitempty"`
-	Disabled    bool   `json:"disabled,omitempty"`
-	Selected    bool   `json:"selected,omitempty"`
 }
 
-// OverlayField is a form field in an overlay descriptor.
-type OverlayField struct {
-	ID      string   `json:"id"`
-	Kind    string   `json:"kind"` // input, password, text, select, confirm
-	Label   string   `json:"label"`
-	Value   string   `json:"value,omitempty"`
-	Options []string `json:"options,omitempty"`
+// PendingSelection is a server-initiated option choice.
+type PendingSelection struct {
+	ID      string            `json:"id"`
+	Kind    string            `json:"kind"`
+	Title   string            `json:"title,omitempty"`
+	Options []SelectionOption `json:"options"`
+	Multi   bool              `json:"multi,omitempty"`
 }
 
-// OverlayDescriptor is the structured data for an interactive overlay.
-type OverlayDescriptor struct {
-	OverlayID   string         `json:"overlay_id"`
-	Kind        string         `json:"kind"` // select, multiselect, form, confirm, viewer, pager
-	Title       string         `json:"title"`
-	Items       []OverlayItem  `json:"items,omitempty"`
-	Fields      []OverlayField `json:"fields,omitempty"`
-	BodyFormat  string         `json:"body_format,omitempty"` // markdown, diff, plain
-	BodyContent string         `json:"body_content,omitempty"`
-	FooterHint  string         `json:"footer_hint,omitempty"`
-}
-
-// OverlayStateMessage is the push frame for overlay state.
-type OverlayStateMessage struct {
+// PendingSelections is the pending-selections array.
+type PendingSelections struct {
 	Type  string             `json:"type"`
-	Stack []OverlayDescriptor `json:"stack"`
+	Items []PendingSelection `json:"items"`
 }
 
-type ConversationSummary struct {
+// ModPanel is one evaluated mod panel's rendered lines.
+type ModPanel struct {
+	ID    string   `json:"id"`
+	Owner string   `json:"owner"`
+	Order int      `json:"order"`
+	Lines []string `json:"lines"`
+}
+
+// ModPanels carries client-polled mod panel lines.
+type ModPanels struct {
+	Type   string     `json:"type"`
+	Panels []ModPanel `json:"panels"`
+}
+
+// AgentItem is one row in the lobby / agent picker.
+type AgentItem struct {
+	ID     string `json:"id"`
+	Name   string `json:"name,omitempty"` // string | null
+	Model  string `json:"model,omitempty"`
+	Pinned bool   `json:"pinned,omitempty"`
+}
+
+// Agents is the agent list for the lobby.
+type Agents struct {
+	Type  string      `json:"type"`
+	Items []AgentItem `json:"items"`
+}
+
+// ConversationItem is one row in the conversation picker.
+type ConversationItem struct {
 	ID            string `json:"id"`
-	AgentID       string `json:"agent_id"`
-	Title         string `json:"title"`
-	Summary       string `json:"summary"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
-	LastMessageAt string `json:"last_message_at"`
-	Archived      bool   `json:"archived"`
-	// Context accounting (local backend): ids currently in context plus the
-	// per-conversation window limit override when set.
-	InContextMessageIDs []string `json:"in_context_message_ids"`
-	ModelSettings       struct {
-		ContextWindowLimit int64 `json:"context_window_limit"`
-	} `json:"model_settings"`
+	Title         string `json:"title,omitempty"`
+	LastMessageAt string `json:"last_message_at,omitempty"`
+	Archived      bool   `json:"archived,omitempty"`
+	Hidden        bool   `json:"hidden,omitempty"`
 }
 
-type ConversationListResponse struct {
-	Success       bool                  `json:"success"`
-	Error         string                `json:"error"`
-	Conversations []ConversationSummary `json:"conversations"`
+// Conversations is the conversation list for a given agent.
+type Conversations struct {
+	Type    string             `json:"type"`
+	AgentID string             `json:"agent_id"`
+	Items   []ConversationItem `json:"items"`
 }
 
-type QueueItem struct {
-	ID         string          `json:"id"`
-	Kind       string          `json:"kind"`
-	Content    json.RawMessage `json:"content"` // string | content parts
-	EnqueuedAt string          `json:"enqueued_at"`
+// ModelItem is one entry in the structured model catalog.
+type ModelItem struct {
+	ID         string `json:"id"`
+	Handle     string `json:"handle"`
+	Label      string `json:"label,omitempty"`
+	Reasoning  string `json:"reasoning,omitempty"`
+	KeyMissing bool   `json:"key_missing,omitempty"`
 }
 
-// ContentText renders queue content that may be a string or content parts.
-func (q *QueueItem) ContentText() string {
-	d := Delta{Content: q.Content}
-	return d.Text()
+// Models is the model catalog.
+type Models struct {
+	Type  string      `json:"type"`
+	Items []ModelItem `json:"items"`
 }
 
-type QueueUpdate struct {
-	Runtime RuntimeScope `json:"runtime"`
-	Queue   []QueueItem  `json:"queue"`
-}
-
-type SubagentSnapshot struct {
-	SubagentID   string `json:"subagent_id"`
-	SubagentType string `json:"subagent_type"`
-	Description  string `json:"description"`
-	Status       string `json:"status"` // pending|running|completed|error
-	IsBackground bool   `json:"is_background"`
-	TotalTokens  int64  `json:"total_tokens"`
-	DurationMs   int64  `json:"duration_ms"`
-	Error        string `json:"error"`
-}
-
-type SubagentUpdate struct {
-	Runtime   RuntimeScope       `json:"runtime"`
-	Subagents []SubagentSnapshot `json:"subagents"`
-}
-
-type AgentSummary struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-type AgentListResponse struct {
-	Success bool           `json:"success"`
-	Error   string         `json:"error"`
-	Agents  []AgentSummary `json:"agents"`
-}
-
-// ConversationMessagesListResponse carries history as LettaMessage objects,
-// which share the message_type discrimination of stream deltas — Delta
-// decodes them.
-type ConversationMessagesListResponse struct {
-	Success  bool    `json:"success"`
-	Error    string  `json:"error"`
-	Messages []Delta `json:"messages"`
-}
-
-type RuntimeStartResponse struct {
-	Success bool          `json:"success"`
-	Error   string        `json:"error"`
-	Runtime *RuntimeScope `json:"runtime"`
-}
-
-type PermissionSuggestion struct {
-	ID   string `json:"id"`
-	Text string `json:"text"`
-}
-
-type DiffHunkLine struct {
-	Type    string `json:"type"` // "context" | "add" | "remove"
-	Content string `json:"content"`
-}
-
-type DiffHunk struct {
-	OldStart int            `json:"oldStart"`
-	OldLines int            `json:"oldLines"`
-	NewStart int            `json:"newStart"`
-	NewLines int            `json:"newLines"`
-	Lines    []DiffHunkLine `json:"lines"`
-}
-
-// DiffPreview: mode "advanced" carries hunks; "fallback"/"unpreviewable"
-// carry a reason.
-type DiffPreview struct {
-	Mode     string     `json:"mode"`
-	FileName string     `json:"fileName"`
-	Hunks    []DiffHunk `json:"hunks"`
-	Reason   string     `json:"reason"`
-}
-
-type ControlRequestBody struct {
-	Subtype               string                 `json:"subtype"` // "can_use_tool"
-	ToolName              string                 `json:"tool_name"`
-	Input                 map[string]any         `json:"input"`
-	ToolCallID            string                 `json:"tool_call_id"`
-	PermissionSuggestions []PermissionSuggestion `json:"permission_suggestions"`
-	BlockedPath           *string                `json:"blocked_path"`
-	Diffs                 []DiffPreview          `json:"diffs"`
-}
-
-type ControlRequest struct {
-	RequestID      string             `json:"request_id"`
-	Request        ControlRequestBody `json:"request"`
-	AgentID        string             `json:"agent_id"`
-	ConversationID string             `json:"conversation_id"`
-}
-
-// Delta is a tolerant union of every stream_delta message type we render:
-// Letta streaming messages (assistant/reasoning/tool call/return/stop_reason)
-// plus UMI lifecycle events (client tool + command + status/retry/loop_error).
-type Delta struct {
-	ID          string          `json:"id"`
-	Date        string          `json:"date"` // ISO timestamp; used to normalize history order
-	MessageType string          `json:"message_type"`
-	Content     json.RawMessage `json:"content"`   // string | [{type:"text",text}]
-	Reasoning   string          `json:"reasoning"` // reasoning_message
-	StopReason  string          `json:"stop_reason"`
-	RunID       string          `json:"run_id"`
-
-	// tool_call_message (letta streaming): arguments stream incrementally.
-	ToolCall *struct {
-		Name       string `json:"name"`
-		Arguments  string `json:"arguments"`
-		ToolCallID string `json:"tool_call_id"`
-	} `json:"tool_call"`
-	// tool_return_message
-	ToolReturn json.RawMessage `json:"tool_return"`
-	Status     string          `json:"status"` // tool_return_message | client_tool_end
-	ToolCallID string          `json:"tool_call_id"`
-	ToolName   string          `json:"tool_name"` // client_tool_start
-	ToolArgs   string          `json:"tool_args"`
-
-	// usage_statistics
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
-	StepCount        int64 `json:"step_count"`
-
-	// command / slash command lifecycle + status / retry / loop_error
-	CommandID    string `json:"command_id"`
-	Input        string `json:"input"`
-	Output       string `json:"output"`
-	Success      *bool  `json:"success"`
-	Preformatted bool   `json:"preformatted"`
-	DimOutput    bool   `json:"dim_output"`
-	Message      string `json:"message"`
-	Level        string `json:"level"`
-}
-
-// ToolReturnText renders the tool_return payload (string or structured).
-func (d *Delta) ToolReturnText() string {
-	if len(d.ToolReturn) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(d.ToolReturn, &s); err == nil {
-		return s
-	}
-	return string(d.ToolReturn)
-}
-
-type StreamDeltaMessage struct {
-	Runtime    RuntimeScope `json:"runtime"`
-	Delta      Delta        `json:"delta"`
-	SubagentID string       `json:"subagent_id"`
-	EventSeq   int64        `json:"event_seq"`
-}
-
-type LoopStatusUpdate struct {
-	Runtime    RuntimeScope `json:"runtime"`
-	LoopStatus LoopState    `json:"loop_status"`
-}
-
-type PendingControlRequestSnapshot struct {
-	RequestID string             `json:"request_id"`
-	Request   ControlRequestBody `json:"request"`
-}
-
-type ModCommandInfo struct {
+// CommandInfo is one slash-command / palette entry.
+type CommandInfo struct {
 	ID          string `json:"id"`
 	Description string `json:"description"`
-	Args        string `json:"args"`
+	ArgsHint    string `json:"args_hint,omitempty"`
+	Routing     string `json:"routing,omitempty"`
+	Source      string `json:"source"`
+	Namespace   string `json:"namespace,omitempty"`
+	Hidden      bool   `json:"hidden,omitempty"`
 }
 
-type DeviceStatusUpdate struct {
-	Runtime      RuntimeScope `json:"runtime"`
-	DeviceStatus struct {
-		ConnectionName         string                          `json:"connection_name"`
-		Mode                   PermissionMode                  `json:"current_permission_mode"`
-		CWD                    string                          `json:"current_working_directory"`
-		IsProcessing           bool                            `json:"is_processing"`
-		LettaCodeVersion       string                          `json:"letta_code_version"`
-		SupportedCommands      []string                        `json:"supported_commands"`
-		ModCommands            []ModCommandInfo                `json:"mod_commands"`
-		PendingControlRequests []PendingControlRequestSnapshot `json:"pending_control_requests"`
-		// MemoryDirectory is the agent's MemFS root on this machine (null
-		// until memfs is enabled). Used by /skills to find agent skills.
-		MemoryDirectory     string                     `json:"memory_directory"`
-		BackgroundProcesses []BackgroundProcessSummary `json:"background_processes"`
-		Experiments         []ExperimentSnapshot       `json:"experiments"`
-	} `json:"device_status"`
+// CommandCatalog is the slash-command / palette catalog.
+type CommandCatalog struct {
+	Type     string        `json:"type"`
+	Commands []CommandInfo `json:"commands"`
 }
 
-// Decode parses an inbound frame. Unknown types yield a Frame with only
-// Type/Raw set — callers should skip what they do not understand.
-func Decode(raw []byte) (Frame, error) {
-	var head struct {
-		Type      string `json:"type"`
-		RequestID string `json:"request_id"`
-	}
-	if err := json.Unmarshal(raw, &head); err != nil {
-		return Frame{}, fmt.Errorf("frame header: %w", err)
-	}
-	f := Frame{Type: head.Type, RequestID: head.RequestID, Raw: append([]byte(nil), raw...)}
-	var err error
-	switch head.Type {
-	// ── ui-server frames ──
-	case "hello_response":
-		f.HelloResponse = &HelloResponse{}
-		err = json.Unmarshal(raw, f.HelloResponse)
-	case "device_status":
-		f.DeviceStatusFlat = &DeviceStatusMessage{}
-		err = json.Unmarshal(raw, f.DeviceStatusFlat)
-	case "turn_start":
-		f.TurnStart = &TurnMessage{}
-		err = json.Unmarshal(raw, f.TurnStart)
-	case "turn_end":
-		f.TurnEnd = &TurnMessage{}
-		err = json.Unmarshal(raw, f.TurnEnd)
-	case "transcript_update":
-		f.TranscriptUpdate = &TranscriptUpdateMessage{}
-		err = json.Unmarshal(raw, f.TranscriptUpdate)
-	case "transcript_sync":
-		f.TranscriptSync = &TranscriptSyncMessage{}
-		err = json.Unmarshal(raw, f.TranscriptSync)
-	case "control_request":
-		f.ControlRequest = &ControlRequest{}
-		err = json.Unmarshal(raw, f.ControlRequest)
-	case "command_result":
-		f.CommandResult = &CommandResultMessage{}
-		err = json.Unmarshal(raw, f.CommandResult)
-	case "bash_output":
-		f.BashOutput = &BashOutputMessage{}
-		err = json.Unmarshal(raw, f.BashOutput)
-	case "error":
-		f.ErrorMsg = &ErrorMessage{}
-		err = json.Unmarshal(raw, f.ErrorMsg)
-	case "overlay_state":
-		f.OverlayState = &OverlayStateMessage{}
-		err = json.Unmarshal(raw, f.OverlayState)
-
-	// ── Legacy protocol_v2 frames (kept for reference; unused under ui-server) ──
-	case "runtime_start_response":
-		f.RuntimeStartResponse = &RuntimeStartResponse{}
-		err = json.Unmarshal(raw, f.RuntimeStartResponse)
-	case "stream_delta":
-		f.StreamDelta = &StreamDeltaMessage{}
-		err = json.Unmarshal(raw, f.StreamDelta)
-	case "update_loop_status":
-		f.LoopStatus = &LoopStatusUpdate{}
-		err = json.Unmarshal(raw, f.LoopStatus)
-	case "update_device_status":
-		f.DeviceStatus = &DeviceStatusUpdate{}
-		err = json.Unmarshal(raw, f.DeviceStatus)
-	case "agent_list_response":
-		f.AgentList = &AgentListResponse{}
-		err = json.Unmarshal(raw, f.AgentList)
-	case "conversation_messages_list_response":
-		f.MessagesList = &ConversationMessagesListResponse{}
-		err = json.Unmarshal(raw, f.MessagesList)
-	case "conversation_list_response":
-		f.ConversationList = &ConversationListResponse{}
-		err = json.Unmarshal(raw, f.ConversationList)
-	case "update_queue":
-		f.QueueUpdate = &QueueUpdate{}
-		err = json.Unmarshal(raw, f.QueueUpdate)
-	case "update_subagent_state":
-		f.SubagentUpdate = &SubagentUpdate{}
-		err = json.Unmarshal(raw, f.SubagentUpdate)
-	case "list_models_response":
-		f.ListModels = &ListModelsResponse{}
-		err = json.Unmarshal(raw, f.ListModels)
-	case "update_model_response":
-		f.UpdateModel = &UpdateModelResponse{}
-		err = json.Unmarshal(raw, f.UpdateModel)
-	}
-	return f, err
+// Toast is a transient client message.
+type Toast struct {
+	Type    string `json:"type"`
+	Level   string `json:"level"` // info | warning | error
+	Message string `json:"message"`
 }
 
-// Text renders delta content that may be a plain string or a list of
-// {type:"text", text:"..."} parts.
-func (d *Delta) Text() string {
-	if len(d.Content) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(d.Content, &s); err == nil {
-		return s
-	}
-	var parts []struct {
+// Notification is a terminal-notification trigger.
+type Notification struct {
+	Type    string `json:"type"`
+	Level   string `json:"level"`
+	Message string `json:"message"`
+	Reason  string `json:"reason"` // awaiting_approval|awaiting_input|turn_complete|hook|other
+}
+
+// ErrorFrame is a generic non-fatal error frame.
+type ErrorFrame struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	RunID   string `json:"run_id,omitempty"`
+}
+
+// ChangeSignal is a "this slice is stale, re-query if showing it" push.
+type ChangeSignal struct {
+	Type string `json:"type"`
+}
+
+// Unknown is any frame whose `type` we don't model. Decode never fails on it.
+type Unknown struct {
+	Type string
+	Raw  json.RawMessage
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// TranscriptLine: the union of every accumulator Line kind (SPEC §4).
+// Field names are the native camelCase; render by Kind.
+// ─────────────────────────────────────────────────────────────────────
+
+// StreamingLine is one buffered output line (shell tool streaming).
+type StreamingLine struct {
+	Text     string `json:"text"`
+	IsStderr bool   `json:"isStderr"`
+}
+
+// StreamingState is the rolling tail buffer for a streaming shell tool.
+type StreamingState struct {
+	TailLines       []StreamingLine `json:"tailLines"`
+	PartialLine     string          `json:"partialLine"`
+	PartialIsStderr bool            `json:"partialIsStderr"`
+	TotalLineCount  int             `json:"totalLineCount"`
+	StartTime       float64         `json:"startTime"`
+}
+
+// EventStats is the compaction-event stats block.
+type EventStats struct {
+	Trigger             string `json:"trigger,omitempty"`
+	ContextTokensBefore int    `json:"contextTokensBefore,omitempty"`
+	ContextTokensAfter  int    `json:"contextTokensAfter,omitempty"`
+	ContextWindow       int    `json:"contextWindow,omitempty"`
+	MessagesCountBefore int    `json:"messagesCountBefore,omitempty"`
+	MessagesCountAfter  int    `json:"messagesCountAfter,omitempty"`
+}
+
+// TranscriptLine mirrors the accumulator `Line` union. Kind selects which
+// fields are meaningful. All fields are omitempty so marshaling round-trips.
+type TranscriptLine struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+
+	// user | reasoning | assistant | error
+	Text           string `json:"text,omitempty"`
+	MessageID      string `json:"messageId,omitempty"`
+	Otid           string `json:"otid,omitempty"`
+	Phase          string `json:"phase,omitempty"`
+	IsContinuation bool   `json:"isContinuation,omitempty"`
+
+	// tool_call
+	ToolCallID                string          `json:"toolCallId,omitempty"`
+	Name                      string          `json:"name,omitempty"`
+	ArgsText                  string          `json:"argsText,omitempty"`
+	UnifiedExecCommandDisplay string          `json:"unifiedExecCommandDisplay,omitempty"`
+	ResultText                string          `json:"resultText,omitempty"`
+	ResultOk                  *bool           `json:"resultOk,omitempty"`
+	Streaming                 *StreamingState `json:"streaming,omitempty"`
+
+	// event
+	EventType string         `json:"eventType,omitempty"`
+	EventData map[string]any `json:"eventData,omitempty"`
+	Summary   string         `json:"summary,omitempty"`
+	Stats     *EventStats    `json:"stats,omitempty"`
+
+	// command | bash_command
+	Input        string `json:"input,omitempty"`
+	Output       string `json:"output,omitempty"`
+	Success      *bool  `json:"success,omitempty"`
+	DimOutput    bool   `json:"dimOutput,omitempty"`
+	Preformatted bool   `json:"preformatted,omitempty"`
+
+	// status
+	Lines []string `json:"lines,omitempty"`
+
+	// trajectory_summary
+	DurationMs float64 `json:"durationMs,omitempty"`
+	StepCount  int     `json:"stepCount,omitempty"`
+	Verb       string  `json:"verb,omitempty"`
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Decode: envelope-sniff on `type`, tolerant (unknown → Unknown, never fatal)
+// ─────────────────────────────────────────────────────────────────────
+
+// Decode parses one JSON-lines frame into its typed Go value. Unknown types
+// decode to *Unknown so the read loop never drops or dies on a frame it
+// doesn't model. A JSON syntax error is the only returned error.
+func Decode(line []byte) (any, error) {
+	var env struct {
 		Type string `json:"type"`
-		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(d.Content, &parts); err == nil {
-		var b strings.Builder
-		for _, p := range parts {
-			b.WriteString(p.Text)
-		}
-		return b.String()
+	if err := json.Unmarshal(line, &env); err != nil {
+		return nil, fmt.Errorf("protocol: decode envelope: %w", err)
 	}
-	return ""
+
+	var out any
+	switch env.Type {
+	case "hello_response":
+		out = new(HelloResponse)
+	case "session_phase":
+		out = new(SessionPhase)
+	case "device":
+		out = new(DeviceState)
+	case "transcript":
+		out = new(Transcript)
+	case "turn":
+		out = new(TurnState)
+	case "pending_approvals":
+		out = new(PendingApprovals)
+	case "pending_selections":
+		out = new(PendingSelections)
+	case "mod_panels":
+		out = new(ModPanels)
+	case "agents":
+		out = new(Agents)
+	case "conversations":
+		out = new(Conversations)
+	case "models":
+		out = new(Models)
+	case "command_catalog":
+		out = new(CommandCatalog)
+	case "toast":
+		out = new(Toast)
+	case "notification":
+		out = new(Notification)
+	case "error":
+		out = new(ErrorFrame)
+	case "settings_updated", "mods_updated", "memory_updated",
+		"skills_updated", "crons_updated", "conversations_updated":
+		return &ChangeSignal{Type: env.Type}, nil
+	default:
+		raw := make(json.RawMessage, len(line))
+		copy(raw, line)
+		return &Unknown{Type: env.Type, Raw: raw}, nil
+	}
+
+	if err := json.Unmarshal(line, out); err != nil {
+		// A structurally-broken but type-known frame still shouldn't kill
+		// the loop; surface it as Unknown.
+		raw := make(json.RawMessage, len(line))
+		copy(raw, line)
+		return &Unknown{Type: env.Type, Raw: raw}, nil
+	}
+	return out, nil
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Client → server events. Each carries its own `type`; constructors set it
+// so callers can't forget. Client.Send marshals any of these to one line.
+// ─────────────────────────────────────────────────────────────────────
+
+type ClientInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+// Hello is the handshake event.
+type Hello struct {
+	Type            string     `json:"type"`
+	ProtocolVersion int        `json:"protocol_version"`
+	Client          ClientInfo `json:"client"`
+}
+
+func NewHello(name, version string) Hello {
+	return Hello{Type: "hello", ProtocolVersion: ProtocolVersion, Client: ClientInfo{Name: name, Version: version}}
+}
+
+// SelectAgent picks an agent in the lobby.
+type SelectAgent struct {
+	Type    string `json:"type"`
+	AgentID string `json:"agent_id"`
+}
+
+func NewSelectAgent(agentID string) SelectAgent {
+	return SelectAgent{Type: "select_agent", AgentID: agentID}
+}
+
+// SelectConversation picks (or creates, id="new") a conversation.
+type SelectConversation struct {
+	Type           string `json:"type"`
+	ConversationID string `json:"conversation_id"`
+}
+
+func NewSelectConversation(conversationID string) SelectConversation {
+	return SelectConversation{Type: "select_conversation", ConversationID: conversationID}
+}
+
+// Attachment is a submitted image reference.
+type Attachment struct {
+	ImageRef string `json:"image_ref"`
+}
+
+// InputSubmit is the submit event — raw text; the server routes it.
+type InputSubmit struct {
+	Type        string       `json:"type"`
+	Text        string       `json:"text"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+func NewInputSubmit(text string) InputSubmit {
+	return InputSubmit{Type: "input_submit", Text: text}
+}
+
+// ApprovalResponse answers a pending_approvals item.
+type ApprovalResponse struct {
+	Type                  string         `json:"type"`
+	ID                    string         `json:"id"` // tool_call_id
+	Decision              string         `json:"decision"`
+	Message               string         `json:"message,omitempty"`
+	UpdatedInput          map[string]any `json:"updated_input,omitempty"`
+	SelectedSuggestionIDs []string       `json:"selected_permission_suggestion_ids,omitempty"`
+}
+
+func NewApprovalResponse(id, decision string) ApprovalResponse {
+	return ApprovalResponse{Type: "approval_response", ID: id, Decision: decision}
+}
+
+// SelectionResponse answers a pending_selections item.
+type SelectionResponse struct {
+	Type    string   `json:"type"`
+	ID      string   `json:"id"`
+	Choice  string   `json:"choice,omitempty"`
+	Choices []string `json:"choices,omitempty"`
+}
+
+// Interrupt aborts the active turn (esc).
+type Interrupt struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
+func NewInterrupt() Interrupt { return Interrupt{Type: "interrupt"} }
+
+// ChangeMode sets the permission mode (shift+tab / /cd).
+type ChangeMode struct {
+	Type           string         `json:"type"`
+	PermissionMode PermissionMode `json:"permission_mode"`
+}
+
+func NewChangeMode(mode PermissionMode) ChangeMode {
+	return ChangeMode{Type: "change_mode", PermissionMode: mode}
+}
+
+// ChangeCwd sets the working directory.
+type ChangeCwd struct {
+	Type string `json:"type"`
+	CWD  string `json:"cwd"`
+}
+
+// ExecuteCommand runs a command explicitly.
+type ExecuteCommand struct {
+	Type      string `json:"type"`
+	CommandID string `json:"command_id"`
+	Args      string `json:"args,omitempty"`
+}
+
+// ModPanelsQuery polls evaluated panel lines at a width.
+type ModPanelsQuery struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id,omitempty"`
+	Width     int    `json:"width"`
+}
+
+func NewModPanelsQuery(width int) ModPanelsQuery {
+	return ModPanelsQuery{Type: "mod_panels_query", Width: width}
+}
+
+// Query is a fire-and-forget slice refresh.
+type Query struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
+func NewQuery(kind string) Query { return Query{Type: kind} }

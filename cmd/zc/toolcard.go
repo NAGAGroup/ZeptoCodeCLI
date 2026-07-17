@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+
+	"github.com/NAGAGroup/ZeptoCodeCLI/internal/protocol"
 )
 
 const (
@@ -116,32 +118,40 @@ func toolParams(name string, rawArgs string, serverCWD string) string {
 	return strings.Join(parts, " ")
 }
 
-// renderToolCard renders a tool entry: header + optional result body.
-func (m *model) renderToolCard(e *entry, w int) string {
-	name := humanizeToolName(e.toolName)
-	params := compactOneLine(toolParams(e.toolName, e.toolArgs.String(), m.serverCWD), max(20, w-len(name)-8))
+// toolStatus classifies a tool_call Line's phase/result into a display state.
+func toolStatus(l *protocol.TranscriptLine) string {
+	switch l.Phase {
+	case "finished":
+		if l.ResultOk != nil && !*l.ResultOk {
+			return "error"
+		}
+		return "success"
+	case "running":
+		return "running"
+	default: // streaming | ready
+		return ""
+	}
+}
+
+// renderToolCard renders a tool_call transcript Line: header + optional body.
+func (m *model) renderToolCard(l *protocol.TranscriptLine, w int) string {
+	name := humanizeToolName(l.Name)
+	params := compactOneLine(toolParams(l.Name, l.ArgsText, m.serverCWD), max(20, w-len(name)-8))
 
 	var icon, suffix string
-	var nameStyle lipgloss.Style
-	switch e.toolStatus {
-	case "success", "allowed":
+	nameStyle := styleToolName
+	switch toolStatus(l) {
+	case "success":
 		icon = styleToolOK.Render(iconToolOK)
-		nameStyle = styleToolName
-	case "error", "denied":
+	case "error":
 		icon = styleToolErr.Render(iconToolErr)
-		nameStyle = styleToolName
-		suffix = "  " + styleToolErr.Render(e.toolStatus)
-	case "awaiting approval":
-		icon = styleTool.Render(iconToolWait)
-		nameStyle = styleToolName
-		suffix = "  " + styleTool.Render("awaiting approval")
+		suffix = "  " + styleToolErr.Render("error")
 	default: // running / streaming args
 		icon = styleTool.Render(iconToolPending)
-		nameStyle = styleToolName
 	}
 	header := fmt.Sprintf("%s %s %s%s", icon, nameStyle.Render(name), styleToolParam.Render(params), suffix)
 
-	body := m.renderToolBody(e, w)
+	body := m.renderToolBody(l, w)
 	if body == "" {
 		return header
 	}
@@ -150,8 +160,8 @@ func (m *model) renderToolCard(e *entry, w int) string {
 
 // renderToolBody renders the truncated result: dim lines behind a rail,
 // expanded by ctrl+o (m.showToolOutput).
-func (m *model) renderToolBody(e *entry, w int) string {
-	ret := strings.TrimRight(e.toolReturn, "\n")
+func (m *model) renderToolBody(l *protocol.TranscriptLine, w int) string {
+	ret := strings.TrimRight(l.ResultText, "\n")
 	if ret == "" {
 		return ""
 	}
